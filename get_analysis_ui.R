@@ -17,8 +17,8 @@ ui <- fluidPage(
       width = 8,
       tabsetPanel(
         id = "mainTabs",
-        tabPanel("Selection Summary", DTOutput("summaryTable")),
-        tabPanel("Selected IDs", verbatimTextOutput("selectedLessonIds")),
+        #tabPanel("Selection Summary", DTOutput("summaryTable")),
+        #tabPanel("Selected IDs", verbatimTextOutput("selectedLessonIds")),
         tabPanel("Get content",
           div(
             actionButton("pullContent", "Analyse content"),

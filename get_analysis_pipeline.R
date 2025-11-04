@@ -55,19 +55,9 @@ split_doc_by_headings <- function(doc, default_level = 2, include_heading = FALS
   }
   blocks <- doc$content
   n <- length(blocks)
-  split_level <- find_split_level(doc, default_level)
-  if (is.na(split_level)) {
-    return(tibble::tibble(
-      section_index = 1L,
-      section_title = "Lead",
-      start_block = 1L,
-      end_block = n,
-      heading_block_index = NA_integer_,
-      subdoc = list(list(type = "doc", content = blocks))
-    ))
-  }
-  is_split_head <- function(b) identical(b$type, "heading") && isTRUE(b$attrs$level == split_level)
-  idx <- which(purrr::map_lgl(blocks, is_split_head))
+  # Split on ANY heading level uniformly
+  is_heading <- function(b) identical(b$type, "heading")
+  idx <- which(purrr::map_lgl(blocks, is_heading))
   if (!length(idx)) {
     return(tibble::tibble(
       section_index = 1L,
@@ -78,8 +68,13 @@ split_doc_by_headings <- function(doc, default_level = 2, include_heading = FALS
       subdoc = list(list(type = "doc", content = blocks))
     ))
   }
+  # Build sections: optional Lead (pre-first-heading), then one section per heading
   ranges <- list(); titles <- character(); heading_ix <- integer()
-  if (idx[1] > 1L) { ranges[[length(ranges) + 1L]] <- c(1L, idx[1] - 1L); titles <- c(titles, "Lead"); heading_ix <- c(heading_ix, NA_integer_) }
+  if (idx[1] > 1L) {
+    ranges[[length(ranges) + 1L]] <- c(1L, idx[1] - 1L)
+    titles <- c(titles, "Lead")
+    heading_ix <- c(heading_ix, NA_integer_)
+  }
   for (i in seq_along(idx)) {
     h <- idx[i]
     start <- if (include_heading) h else (h + 1L)
@@ -95,9 +90,7 @@ split_doc_by_headings <- function(doc, default_level = 2, include_heading = FALS
     end_block = vapply(ranges, `[`, 2L, FUN.VALUE = integer(1)),
     heading_block_index = heading_ix
   )
-  if (drop_empty_sections) {
-    sec_tbl <- dplyr::filter(sec_tbl, is.na(start_block) | is.na(end_block) | end_block >= start_block)
-  }
+  # Build subdocs; allow empty sections (start > end) to become empty docs
   subdocs <- purrr::pmap(list(sec_tbl$start_block, sec_tbl$end_block), function(s, e) {
     if (is.na(s) || is.na(e) || s > e) list(type = "doc", content = list()) else list(type = "doc", content = blocks[s:e])
   })
@@ -310,13 +303,13 @@ replace_tables_with_placeholders <- function(json_input) {
 
 extract_tables_as_dataframe <- function(json_input) {
   # Extract top-level tables for later replacement
-  tbl <- jsonlite::fromJSON(json_input, flatten = FALSE) %>%
-    tibble::as_tibble() %>%
-    .[["content"]] %>% 
+  doc <- jsonlite::fromJSON(json_input, flatten = FALSE)
+  content <- doc[["content"]]
+  if (is.null(content) || !is.data.frame(content) || nrow(content) == 0) return(data.frame())
+  tibble::as_tibble(content) %>%
     dplyr::mutate(table_id = paste0(toupper(type), stringr::str_pad(dplyr::row_number(), width = 3, pad = "0"))) %>%
     dplyr::filter(type == "table") %>%
     dplyr::select(table_id, content)
-  tbl
 }
 
 replace_nested_tables_with_placeholders3 <- function(json_input) {
@@ -340,10 +333,10 @@ replace_nested_tables_with_placeholders3 <- function(json_input) {
 
 extract_tables_from_callouts <- function(json_input) {
   # Pull out nested tables from callouts to restore later
-  parsed_json <- jsonlite::fromJSON(json_input, flatten = TRUE) %>%
-    tibble::as_tibble() %>%
-    .[["content"]]
-  callout_nodes <- parsed_json %>% dplyr::filter(type == "callout")
+  doc <- jsonlite::fromJSON(json_input, flatten = TRUE)
+  content <- doc[["content"]]
+  if (is.null(content) || !is.data.frame(content) || nrow(content) == 0) return(data.frame())
+  callout_nodes <- tibble::as_tibble(content) %>% dplyr::filter(type == "callout")
   nested_tables <- list()
   if (nrow(callout_nodes) > 0) {
     for (i in seq_len(nrow(callout_nodes))) {
@@ -364,11 +357,10 @@ extract_tables_from_callouts <- function(json_input) {
 }
 
 has_tables <- function(json_input) {
-  jsonlite::fromJSON(json_input, flatten = FALSE) %>%
-    tibble::as_tibble() %>%
-    .[["content"]] %>%
-    dplyr::filter(type == "table") %>%
-    nrow() > 0
+  doc <- jsonlite::fromJSON(json_input, flatten = FALSE)
+  content <- doc[["content"]]
+  if (is.null(content) || !is.data.frame(content) || nrow(content) == 0) return(FALSE)
+  tibble::as_tibble(content) %>% dplyr::filter(type == "table") %>% nrow() > 0
 }
 
 has_nested_tables <- function(json_input) {
@@ -532,14 +524,22 @@ parse_content_df <- function(pulled_content_df) {
 build_sections_index <- function(content_parsed) {
   if (is.null(content_parsed) || nrow(content_parsed) == 0) return(tibble::tibble())
   idx <- content_parsed %>%
-    dplyr::mutate(sections = purrr::map(doc, split_doc_by_headings)) %>%
+    dplyr::mutate(sections = purrr::map(doc, ~ split_doc_by_headings(.x, include_heading = TRUE))) %>%
     dplyr::select(lesson_id, sections) %>%
     tidyr::unnest(sections) %>%
     dplyr::arrange(lesson_id, section_index) %>%
     dplyr::mutate(
       section_title_norm = stringr::str_squish(section_title),
-      subdoc_json = purrr::map_chr(subdoc, subdoc_to_json),
-      plaintext = purrr::map_chr(subdoc, extract_plaintext_from_subdoc)
+      subdoc_json = purrr::map_chr(subdoc, ~ jsonlite::toJSON(.x, auto_unbox = TRUE, null = "null", digits = NA)),
+      plaintext = purrr::map_chr(subdoc, function(sd) {
+        # Build content-only subdoc by removing a leading heading block
+        if (!is.null(sd$content) && length(sd$content) > 0 && is.list(sd$content[[1]]) && identical(sd$content[[1]]$type, "heading")) {
+          sd <- list(type = "doc", content = if (length(sd$content) > 1) sd$content[-1] else list())
+        }
+        out <- get_content_text(jsonlite::toJSON(sd, auto_unbox = TRUE, null = "null", digits = NA))$content_text
+        out <- as.character(out %||% "")
+        stringr::str_squish(out)
+      })
     )
   idx
 }
@@ -562,37 +562,39 @@ compute_section_text_metrics <- function(sections_index) {
 # Aggregate per-section block features into metrics (counts, words, etc.)
 aggregate_blocks_by_section <- function(sections_index) {
   if (is.null(sections_index) || nrow(sections_index) == 0) return(tibble::tibble())
+
   blocks_by_section <- sections_index %>%
     dplyr::mutate(
       block_rows = purrr::pmap(
         list(lesson_id, section_index, subdoc),
         ~ analyze_section_blocks(..1, ..2, ..3)
       )
-    ) %>%
-    dplyr::mutate(block_rows = purrr::map(block_rows, ~ if (nrow(.x)) dplyr::select(.x, -lesson_id, -section_index) else .x)) %>%
-    dplyr::select(lesson_id, section_index, block_rows) %>%
-    tidyr::unnest(block_rows)
-
-  if (is.null(blocks_by_section) || nrow(blocks_by_section) == 0) return(tibble::tibble())
+    )
 
   blocks_by_section %>%
-    dplyr::group_by(lesson_id, section_index) %>%
-    dplyr::summarise(
-      blocks_total = dplyr::n(),
-      words_sum = sum(words_excl_math, na.rm = TRUE),
-      words_mean = mean(words_excl_math, na.rm = TRUE),
-      words_median = stats::median(words_excl_math, na.rm = TRUE),
-      words_max = max(words_excl_math, na.rm = TRUE),
-      headings_count = sum(block_type == "heading", na.rm = TRUE),
-      images_count = sum(is_image, na.rm = TRUE),
-      tables_count = sum(is_table, na.rm = TRUE),
-      lists_count = sum(is_list, na.rm = TRUE),
-      latex_total = sum(latex_total, na.rm = TRUE),
-      latex_inline = sum(latex_inline, na.rm = TRUE),
-      latex_display = sum(latex_display, na.rm = TRUE),
-      latex_display_multi = sum(latex_display_multiline, na.rm = TRUE),
-      inline_to_display_ratio = dplyr::if_else(latex_display > 0, latex_inline / latex_display, as.numeric(NA)),
-      .groups = "drop"
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+      blocks_total        = nrow(block_rows),
+      words_sum           = if (nrow(block_rows)) sum(block_rows$words_excl_math, na.rm = TRUE) else 0,
+      words_mean          = if (nrow(block_rows)) mean(block_rows$words_excl_math, na.rm = TRUE) else NA_real_,
+      words_median        = if (nrow(block_rows)) stats::median(block_rows$words_excl_math, na.rm = TRUE) else NA_real_,
+      words_max           = if (nrow(block_rows)) max(block_rows$words_excl_math, na.rm = TRUE) else NA_real_,
+      headings_count      = if (nrow(block_rows)) sum(block_rows$block_type == "heading", na.rm = TRUE) else 0,
+      images_count        = if (nrow(block_rows)) sum(block_rows$is_image, na.rm = TRUE) else 0,
+      tables_count        = if (nrow(block_rows)) sum(block_rows$is_table, na.rm = TRUE) else 0,
+      lists_count         = if (nrow(block_rows)) sum(block_rows$is_list, na.rm = TRUE) else 0,
+      latex_total         = if (nrow(block_rows)) sum(block_rows$latex_total, na.rm = TRUE) else 0,
+      latex_inline        = if (nrow(block_rows)) sum(block_rows$latex_inline, na.rm = TRUE) else 0,
+      latex_display       = if (nrow(block_rows)) sum(block_rows$latex_display, na.rm = TRUE) else 0,
+      latex_display_multi = if (nrow(block_rows)) sum(block_rows$latex_display_multiline, na.rm = TRUE) else 0,
+      inline_to_display_ratio = dplyr::if_else(latex_display > 0, latex_inline / latex_display, as.numeric(NA))
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(
+      lesson_id, section_index,
+      blocks_total, words_sum, words_mean, words_median, words_max,
+      headings_count, images_count, tables_count, lists_count,
+      latex_total, latex_inline, latex_display, latex_display_multi, inline_to_display_ratio
     )
 }
 

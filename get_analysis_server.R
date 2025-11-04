@@ -125,6 +125,15 @@ server <- function(input, output, session) {
     }
   })
 
+  # Expose latest raw Tiptap JSON per lesson for inspection in RStudio
+  # Access as: View(lessons_tiptap_raw_last)
+  observe({
+    raw_df <- pulled_content_df()
+    if (!is.null(raw_df) && nrow(raw_df) > 0) {
+      assign("lessons_tiptap_raw_last", raw_df, envir = .GlobalEnv)
+    }
+  })
+
   output$sectionMetricsTable <- renderDT({
     df <- section_metrics_refactored()
     if (is.null(df) || nrow(df) == 0) {
