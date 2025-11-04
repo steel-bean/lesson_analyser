@@ -1,7 +1,11 @@
-# Define server logic required to draw a histogram
+# Shiny server: selections, content fetch, section metrics, and outputs
+source("get_analysis_pipeline.R")
 server <- function(input, output, session) {
   
+  # Holds DB rows (lesson_id, content JSON) fetched on demand
+  pulled_content_df <- reactiveVal(NULL)
   
+  # Summarise the tree selection into unique Course/Module/Chapter/Lesson rows
   selected_summary <- reactive({
     
     selected <- input$lessonTree
@@ -59,6 +63,91 @@ server <- function(input, output, session) {
       distinct(Name, Type, Lesson_ID)
   })
   
+  # On click, pull JSON content for the selected lesson IDs from DB
+  observeEvent(input$pullContent, {
+    ids <- selected_lesson_ids()
+    if (is.null(ids) || length(ids) == 0) {
+      pulled_content_df(NULL)
+      return()
+    }
+    
+    connection <- DBI::dbConnect(
+      RMariaDB::MariaDB(),
+      dbname   = 'learnable',
+      host     = '127.0.0.1',
+      port     = 2244,
+      user     = 'dbeaver',
+      password = 'shizkqhsh-18-791uwhsjw-891'
+    )
+    on.exit(DBI::dbDisconnect(connection), add = TRUE)
+    
+    ids_sql <- paste(DBI::dbQuoteString(connection, ids), collapse = ",")
+    query <- paste0(
+      "SELECT\n",
+      "  CAST(l.id AS CHAR) AS lesson_id,\n",
+      "  d.content           AS content\n",
+      "FROM lessons l\n",
+      "JOIN docs d ON l.doc_id = d.id\n",
+      "WHERE l.id IN (", ids_sql, ");"
+    )
+    
+    df <- DBI::dbGetQuery(connection, query) %>%
+      tibble::as_tibble()
+    
+    pulled_content_df(df)
+  })
+  
+  # Preview of pulled JSON per lesson
+  output$pulledContentTable <- renderDT({
+    df <- pulled_content_df()
+    if (is.null(df) || nrow(df) == 0) {
+      return(datatable(data.frame()))
+    }
+    content_chr <- as.character(df$content)
+    preview <- ifelse(nchar(content_chr) > 200, paste0(substr(content_chr, 1, 200), "…"), content_chr)
+    datatable(
+      tibble::tibble(lesson_id = df$lesson_id, content_preview = preview),
+      rownames = FALSE,
+      options = list(pageLength = 10)
+    )
+  })
+  
+  # Section metrics table via the refactored pipeline
+  section_metrics_refactored <- reactive({
+    build_section_metrics_table(pulled_content_df())
+  })
+  
+  # Expose latest table for inspection in RStudio: View(section_metrics_last)
+  observe({
+    df <- section_metrics_refactored()
+    if (!is.null(df) && nrow(df) > 0) {
+      assign("section_metrics_last", df, envir = .GlobalEnv)
+    }
+  })
+
+  output$sectionMetricsTable <- renderDT({
+    df <- section_metrics_refactored()
+    if (is.null(df) || nrow(df) == 0) {
+      return(datatable(data.frame()))
+    }
+    datatable(df, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
+  })
+  
+  # Optional: save table snapshot to data/ when button used
+  observeEvent(input$saveSectionMetrics, {
+    df <- section_metrics_refactored()
+    if (is.null(df) || nrow(df) == 0) {
+      showNotification("Nothing to save: table is empty.", type = "warning")
+      return()
+    }
+    dir.create("data", showWarnings = FALSE)
+    ts <- format(Sys.time(), "%Y-%m-%d_%H%M%S")
+    path <- file.path("data", paste0("section_metrics_", ts, ".rds"))
+    saveRDS(df, path)
+    showNotification(paste0("Saved section metrics to ", path), type = "message")
+  })
+  
+  # Selection summary table: hides redundant child rows
   output$summaryTable <- renderDT({
     df <- selected_summary()
     
@@ -98,6 +187,7 @@ server <- function(input, output, session) {
     datatable(hide_redundant(df), rownames = FALSE)
   })
   
+  # Helper to collapse selected tree rows into unique lesson IDs
   selected_lesson_ids <- reactive({
     selected_summary() %>%
       filter(Type == "Lesson") %>%
@@ -105,11 +195,17 @@ server <- function(input, output, session) {
       unique()
   })
   
+  # Simple text view of selected lesson IDs
+  output$selectedLessonIds <- renderText({
+    ids <- selected_lesson_ids()
+    if (length(ids) == 0) {
+      "None selected"
+    } else {
+      paste(ids, collapse = ", ")
+    }
+  })
   
-  
-  
-  #get the lesson text for selected lessons
-  
+  # Legacy cache updater for lesson text (kept for compatibility)
   lesson_text_df <- reactive({
     get_updated_lesson_text(
       selected_lesson_ids = selected_lesson_ids(),
@@ -117,7 +213,5 @@ server <- function(input, output, session) {
       content_tree = content_tree
     )
   })
-  
-  
   
 }
