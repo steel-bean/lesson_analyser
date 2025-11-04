@@ -141,6 +141,41 @@ server <- function(input, output, session) {
     }
     datatable(df, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
   })
+
+  # Aggregated per-lesson metrics (sums only; exclude non-countable metrics)
+  lesson_metrics <- reactive({
+    df <- section_metrics_refactored()
+    if (is.null(df) || nrow(df) == 0) return(tibble::tibble())
+    df %>%
+      dplyr::group_by(lesson_id) %>%
+      dplyr::summarise(
+        plaintext = stringr::str_trunc(stringr::str_squish(paste(plaintext, collapse = " ")), 100),
+        words_total = sum(words_total, na.rm = TRUE),
+        words_nomath = sum(words_nomath, na.rm = TRUE),
+        chars_total = sum(chars_total, na.rm = TRUE),
+        sentences_nomath = sum(sentences_nomath, na.rm = TRUE),
+        blocks_total = sum(blocks_total, na.rm = TRUE),
+        words_sum = sum(words_sum, na.rm = TRUE),
+        headings_count = sum(headings_count, na.rm = TRUE),
+        images_count = sum(images_count, na.rm = TRUE),
+        tables_count = sum(tables_count, na.rm = TRUE),
+        lists_count = sum(lists_count, na.rm = TRUE),
+        latex_total = sum(latex_total, na.rm = TRUE),
+        latex_inline = sum(latex_inline, na.rm = TRUE),
+        latex_display = sum(latex_display, na.rm = TRUE),
+        latex_display_multi = sum(latex_display_multi, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      dplyr::arrange(lesson_id)
+  })
+
+  output$lessonMetricsTable <- renderDT({
+    df <- lesson_metrics()
+    if (is.null(df) || nrow(df) == 0) {
+      return(datatable(data.frame()))
+    }
+    datatable(df, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
+  })
   
   # Optional: save table snapshot to data/ when button used
   observeEvent(input$saveSectionMetrics, {

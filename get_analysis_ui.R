@@ -26,7 +26,8 @@ ui <- fluidPage(
             br(),
             DTOutput("sectionMetricsTable")
           )
-        )
+        ),
+        tabPanel("Lesson Analysis", DTOutput("lessonMetricsTable"))
       )
     )
   )
