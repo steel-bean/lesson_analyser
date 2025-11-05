@@ -25,7 +25,13 @@ ui <- fluidPage(
             DTOutput("sectionMetricsTable")
           )
         ),
-        tabPanel("Lesson Analysis", DTOutput("lessonMetricsTable"))
+        tabPanel("Lesson Analysis",
+          div(
+            selectInput("lessonMetric", "Metric", choices = NULL, width = "300px"),
+            plotOutput("lessonMetricPlot", height = "300px"),
+            DTOutput("lessonMetricsTable")
+          )
+        )
       )
     )
   )

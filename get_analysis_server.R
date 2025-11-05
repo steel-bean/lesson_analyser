@@ -182,6 +182,33 @@ server <- function(input, output, session) {
     }
     datatable(df, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
   })
+
+  # Metric selection and distribution plot for Lesson Analysis
+  numeric_metric_names <- c(
+    "words_total","words_nomath","chars_total","sentences_nomath",
+    "blocks_total","words_sum","headings_count","images_count",
+    "tables_count","lists_count","latex_total","latex_inline",
+    "latex_display","latex_display_multi"
+  )
+
+  observe({
+    df <- lesson_metrics()
+    if (is.null(df) || nrow(df) == 0) return()
+    ok <- intersect(numeric_metric_names, names(df))
+    if (length(ok) == 0) return()
+    updateSelectInput(session, "lessonMetric", choices = ok, selected = ok[[1]])
+  })
+
+  output$lessonMetricPlot <- renderPlot({
+    df <- lesson_metrics()
+    req(!is.null(df), nrow(df) > 0, input$lessonMetric)
+    m <- input$lessonMetric
+    req(m %in% names(df))
+    ggplot2::ggplot(df, ggplot2::aes_string(x = m)) +
+      ggplot2::geom_histogram(bins = 30, fill = "#4C78A8", color = "white") +
+      ggplot2::labs(x = m, y = "Count") +
+      ggplot2::theme_minimal(base_size = 12)
+  })
   
   # Optional: save table snapshot to data/ when button used
   observeEvent(input$saveSectionMetrics, {
