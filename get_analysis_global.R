@@ -30,6 +30,13 @@ library(googlesheets4)
 #timer
 library(tictoc)
 
+# plotting layout
+library(patchwork)
+library(ggExtra)
+
+# Optional side-panel geoms for distributions
+ggside_available <- requireNamespace("ggside", quietly = TRUE)
+
 
 #initialisation
 
@@ -42,6 +49,7 @@ cache_path <- "cache"
 
 content_tree_file <- file.path(cache_path, paste0("content_tree_", today_string, ".rds"))
 lesson_text_file <- file.path(cache_path, paste0("lesson_text_app-", today_string, ".rds"))
+analysis_cache_file <- file.path(cache_path, "analysis_cache.rds")
 
 
 #function that retrieves the content structure from the Learnable database
@@ -128,6 +136,13 @@ cached_lesson_text <- if (file.exists(lesson_text_file)) {
   readRDS(lesson_text_file)
 } else {
   tibble(lesson_id = character(), lesson = character(), text = character())
+}
+
+# Analysis cache: section-level analysis rows with freshness timestamp
+analysis_cache <- if (file.exists(analysis_cache_file)) {
+  readRDS(analysis_cache_file)
+} else {
+  tibble::tibble()
 }
 
 

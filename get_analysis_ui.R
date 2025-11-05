@@ -15,20 +15,34 @@ ui <- fluidPage(
     ),
     mainPanel(
       width = 8,
-      tags$div(style = "margin-bottom: 12px;", actionButton("pullContent", "Analyse content")),
+      tags$div(
+        style = "margin-bottom: 12px; display: flex; align-items: center; gap: 12px;",
+        actionButton("pullContent", "Analyse content"),
+        tags$span(textOutput("analysisProgress", inline = TRUE), style = "color:#666;")
+      ),
       tabsetPanel(
         id = "mainTabs",
         #tabPanel("Selection Summary", DTOutput("summaryTable")),
         #tabPanel("Selected IDs", verbatimTextOutput("selectedLessonIds")),
         tabPanel("Section-Level Analysis",
           div(
+            div(style = "display:flex; gap:16px; align-items:center;",
+              selectInput("sectionMetric", "Metric", choices = NULL, width = "300px"),
+              selectInput("sectionDist", "Distribution", choices = c("Boxplot","Histogram"), selected = "Boxplot", width = "200px")
+            ),
+            plotOutput("sectionMetricDist", height = "240px"),
+            plotOutput("sectionMetricPlot", height = "500px", click = "sectionPlot_click"),
             DTOutput("sectionMetricsTable")
           )
         ),
         tabPanel("Lesson Analysis",
           div(
-            selectInput("lessonMetric", "Metric", choices = NULL, width = "300px"),
-            plotOutput("lessonMetricPlot", height = "300px"),
+            div(style = "display:flex; gap:16px; align-items:center;",
+              selectInput("lessonMetric", "Metric", choices = NULL, width = "300px"),
+              selectInput("lessonDist", "Distribution", choices = c("Boxplot","Histogram"), selected = "Boxplot", width = "200px")
+            ),
+            plotOutput("lessonMetricDist", height = "240px"),
+            plotOutput("lessonMetricPlot", height = "500px", click = "lessonPlot_click"),
             DTOutput("lessonMetricsTable")
           )
         )
