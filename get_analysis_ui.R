@@ -15,15 +15,13 @@ ui <- fluidPage(
     ),
     mainPanel(
       width = 8,
+      tags$div(style = "margin-bottom: 12px;", actionButton("pullContent", "Analyse content")),
       tabsetPanel(
         id = "mainTabs",
         #tabPanel("Selection Summary", DTOutput("summaryTable")),
         #tabPanel("Selected IDs", verbatimTextOutput("selectedLessonIds")),
-        tabPanel("Get content",
+        tabPanel("Section-Level Analysis",
           div(
-            actionButton("pullContent", "Analyse content"),
-
-            br(),
             DTOutput("sectionMetricsTable")
           )
         ),

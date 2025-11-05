@@ -146,7 +146,7 @@ server <- function(input, output, session) {
   lesson_metrics <- reactive({
     df <- section_metrics_refactored()
     if (is.null(df) || nrow(df) == 0) return(tibble::tibble())
-    df %>%
+    out <- df %>%
       dplyr::group_by(lesson_id) %>%
       dplyr::summarise(
         plaintext = stringr::str_trunc(stringr::str_squish(paste(plaintext, collapse = " ")), 100),
@@ -166,7 +166,13 @@ server <- function(input, output, session) {
         latex_display_multi = sum(latex_display_multi, na.rm = TRUE),
         .groups = "drop"
       ) %>%
+      dplyr::left_join(
+        content_tree %>% dplyr::select(lesson_id, lesson) %>% dplyr::distinct(),
+        by = "lesson_id"
+      ) %>%
+      dplyr::relocate(lesson, .after = lesson_id) %>%
       dplyr::arrange(lesson_id)
+    out
   })
 
   output$lessonMetricsTable <- renderDT({
