@@ -153,6 +153,12 @@ server <- function(input, output, session) {
     } else {
       sec_tbl <- cached
     }
+    # Backward compatibility: ensure heading-by-level columns exist on section table (cached rows may lack them)
+    ensure_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6")
+    missing <- setdiff(ensure_cols, names(sec_tbl))
+    if (length(missing)) {
+      for (nm in missing) sec_tbl[[nm]] <- 0L
+    }
     .state$sec_acc <- dplyr::bind_rows(.state$sec_acc, sec_tbl)
     # push to reactive store for UI consumers
     section_metrics_acc(.state$sec_acc)
@@ -169,6 +175,11 @@ server <- function(input, output, session) {
         blocks_total = sum(blocks_total, na.rm = TRUE),
         words_sum = sum(words_sum, na.rm = TRUE),
         headings_count = sum(headings_count, na.rm = TRUE),
+        headings_h1 = sum(headings_h1, na.rm = TRUE),
+        headings_h2 = sum(headings_h2, na.rm = TRUE),
+        headings_h3 = sum(headings_h3, na.rm = TRUE),
+        
+        headings_h6 = sum(headings_h6, na.rm = TRUE),
         images_count = sum(images_count, na.rm = TRUE),
         tables_count = sum(tables_count, na.rm = TRUE),
         lists_count = sum(lists_count, na.rm = TRUE),
@@ -404,7 +415,7 @@ server <- function(input, output, session) {
     # Candidate numeric metrics present in section table
     candidates <- c(
       "words_total","words_nomath","chars_total","sentences_nomath",
-      "blocks_total","words_sum","headings_count","images_count",
+      "blocks_total","words_sum","headings_count","headings_h1","headings_h2","headings_h3","headings_h6","images_count",
       "tables_count","lists_count","latex_total","latex_inline",
       "latex_display","latex_display_multi"
     )
@@ -534,6 +545,12 @@ server <- function(input, output, session) {
     if (!is.null(acc) && nrow(acc) > 0) return(acc)
     df <- section_metrics_refactored()
     if (is.null(df) || nrow(df) == 0) return(tibble::tibble())
+    # Ensure heading-by-level columns exist for new metric support even with older cached rows
+    ensure_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6")
+    missing <- setdiff(ensure_cols, names(df))
+    if (length(missing)) {
+      for (nm in missing) df[[nm]] <- 0L
+    }
     out <- df %>%
       dplyr::group_by(lesson_id) %>%
       dplyr::summarise(
@@ -545,6 +562,11 @@ server <- function(input, output, session) {
         blocks_total = sum(blocks_total, na.rm = TRUE),
         words_sum = sum(words_sum, na.rm = TRUE),
         headings_count = sum(headings_count, na.rm = TRUE),
+        headings_h1 = sum(headings_h1, na.rm = TRUE),
+        headings_h2 = sum(headings_h2, na.rm = TRUE),
+        headings_h3 = sum(headings_h3, na.rm = TRUE),
+        
+        headings_h6 = sum(headings_h6, na.rm = TRUE),
         images_count = sum(images_count, na.rm = TRUE),
         tables_count = sum(tables_count, na.rm = TRUE),
         lists_count = sum(lists_count, na.rm = TRUE),
@@ -579,7 +601,7 @@ server <- function(input, output, session) {
   # Metric selection and distribution plot for Lesson Analysis
   numeric_metric_names <- c(
     "words_total","words_nomath","chars_total","sentences_nomath",
-    "blocks_total","words_sum","headings_count","images_count",
+    "blocks_total","words_sum","headings_count","headings_h1","headings_h2","headings_h3","headings_h6","images_count",
     "tables_count","lists_count","latex_total","latex_inline",
     "latex_display","latex_display_multi"
   )

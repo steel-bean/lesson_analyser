@@ -129,7 +129,15 @@ extract_latex_in_block <- function(block) {
 # Block feature extractors used for per-block and per-section metrics
 an_node_type <- function(block_node) {
   btype <- block_node$type %||% NA_character_
-  hlev <- if (identical(btype, "heading")) block_node$attrs$level %||% NA_integer_ else NA_integer_
+  # Robustly coerce heading level from tiptap JSON (may be numeric or character)
+  hlev <- NA_integer_
+  if (identical(btype, "heading")) {
+    lvl <- tryCatch(block_node$attrs$level, error = function(e) NA)
+    if (!is.null(lvl)) {
+      hlev <- suppressWarnings(as.integer(lvl))
+      if (!is.finite(hlev)) hlev <- NA_integer_
+    }
+  }
   tibble::tibble(
     block_type = btype,
     heading_level = hlev,
@@ -580,6 +588,10 @@ aggregate_blocks_by_section <- function(sections_index) {
       words_median        = if (nrow(block_rows)) stats::median(block_rows$words_excl_math, na.rm = TRUE) else NA_real_,
       words_max           = if (nrow(block_rows)) max(block_rows$words_excl_math, na.rm = TRUE) else NA_real_,
       headings_count      = if (nrow(block_rows)) sum(block_rows$block_type == "heading", na.rm = TRUE) else 0,
+      headings_h1         = if (nrow(block_rows)) sum(block_rows$block_type == "heading" & block_rows$heading_level == 1L, na.rm = TRUE) else 0,
+      headings_h2         = if (nrow(block_rows)) sum(block_rows$block_type == "heading" & block_rows$heading_level == 2L, na.rm = TRUE) else 0,
+      headings_h3         = if (nrow(block_rows)) sum(block_rows$block_type == "heading" & block_rows$heading_level == 3L, na.rm = TRUE) else 0,
+      headings_h6         = if (nrow(block_rows)) sum(block_rows$block_type == "heading" & block_rows$heading_level == 6L, na.rm = TRUE) else 0,
       images_count        = if (nrow(block_rows)) sum(block_rows$is_image, na.rm = TRUE) else 0,
       tables_count        = if (nrow(block_rows)) sum(block_rows$is_table, na.rm = TRUE) else 0,
       lists_count         = if (nrow(block_rows)) sum(block_rows$is_list, na.rm = TRUE) else 0,
@@ -593,7 +605,8 @@ aggregate_blocks_by_section <- function(sections_index) {
     dplyr::select(
       lesson_id, section_index,
       blocks_total, words_sum, words_mean, words_median, words_max,
-      headings_count, images_count, tables_count, lists_count,
+      headings_count, headings_h1, headings_h2, headings_h3, headings_h6,
+      images_count, tables_count, lists_count,
       latex_total, latex_inline, latex_display, latex_display_multi, inline_to_display_ratio
     )
 }
@@ -616,7 +629,8 @@ build_section_metrics_table <- function(pulled_content_df) {
       words_total, words_nomath, chars_total, sentences_nomath, avg_words_per_sentence,
       section_title_norm,
       blocks_total, words_sum, words_mean, words_median, words_max,
-      headings_count, images_count, tables_count, lists_count,
+      headings_count, headings_h1, headings_h2, headings_h3, headings_h6,
+      images_count, tables_count, lists_count,
       latex_total, latex_inline, latex_display, latex_display_multi, inline_to_display_ratio,
       start_block, end_block#,
       # subdoc_json  # Keep commented: large strings; enable if needed for debugging
