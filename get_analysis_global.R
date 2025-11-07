@@ -34,6 +34,8 @@ library(tictoc)
 library(patchwork)
 library(ggExtra)
 library(cowplot)
+library(plotly)
+library(ggiraph)
 
 # Optional side-panel geoms for distributions
 ggside_available <- requireNamespace("ggside", quietly = TRUE)

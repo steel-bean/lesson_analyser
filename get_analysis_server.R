@@ -1,5 +1,6 @@
 # Shiny server: selections, content fetch, section metrics, and outputs
 source("get_analysis_pipeline.R")
+source("R/helpers_shared_x.R")
 server <- function(input, output, session) {
   
   # Holds DB rows (lesson_id, content JSON) fetched on demand
@@ -354,6 +355,190 @@ server <- function(input, output, session) {
   section_proxy <- dataTableProxy("sectionMetricsTable")
   lesson_proxy  <- dataTableProxy("lessonMetricsTable")
 
+  # ---- NEW: Section charts using shared scale + ggiraph ----
+  section_plot_data <- reactive({
+    full_df <- section_metrics_display()
+    req(!is.null(full_df), nrow(full_df) > 0, input$sectionMetric)
+    m <- input$sectionMetric
+    df <- full_df %>% dplyr::filter(is.finite(words_total) & words_total > 0)
+    req(nrow(df) > 0)
+    if (!("section_index" %in% names(df)) || all(is.na(df$section_index))) df$section_index <- seq_len(nrow(df))
+    df <- df %>%
+      dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
+      dplyr::mutate(sec_label = paste0(lesson, "-", section_index)) %>%
+      dplyr::group_by(sec_label) %>%
+      dplyr::summarise(value = suppressWarnings(as.numeric(sum(.data[[m]], na.rm = TRUE))), .groups = "drop") %>%
+      dplyr::mutate(value = as.numeric(value)) %>%
+      dplyr::filter(is.finite(value))
+    list(df = df, metric_name = m)
+  })
+
+  section_shared_x <- reactive({
+    pd <- section_plot_data()
+    compute_shared_x(datasets = list(pd$df, pd$df), x_cols = c("value","value"), n_breaks = 6)
+  })
+
+  section_highlights <- reactive({
+    pd <- section_plot_data(); df <- pd$df
+    sel <- input$sectionMetricsTable_rows_selected
+    if (!is.null(sel) && length(sel) == 1 && sel >= 1 && sel <= nrow(df)) df$sec_label[sel] else character(0)
+  })
+
+  output$sectionTop_gx <- ggiraph::renderGirafe({
+    pd <- section_plot_data()
+    if (!is.null(input$sectionDist) && identical(input$sectionDist, "Boxplot")) {
+      make_top_box_interactive(data = pd$df, x_col = "value", shared = section_shared_x(), left_pad_pt = 120,
+                               add_quartile_bands = TRUE, add_outliers = TRUE)
+    } else {
+      make_top_hist_interactive(data = pd$df, x_col = "value", shared = section_shared_x(), bins = 20, left_pad_pt = 120)
+    }
+  })
+
+  output$sectionBars_gx <- ggiraph::renderGirafe({
+    pd <- section_plot_data()
+    make_bottom_bars_interactive(data = pd$df, x_col = "value", label_col = "sec_label",
+                                 shared = section_shared_x(), left_pad_pt = 120,
+                                 highlight_labels = section_highlights())
+  })
+
+  observeEvent(input$sectionBars_gx_selected, {
+    labs <- input$sectionBars_gx_selected
+    req(length(labs) >= 1)
+    pd <- section_plot_data()
+    idx <- match(labs[1], pd$df$sec_label)
+    if (is.finite(idx)) selectRows(section_proxy, idx)
+  })
+
+  # ---- NEW: Section Plotly combined chart (shared x, click selects) ----
+  output$sectionPlotly <- plotly::renderPlotly({
+    pd <- section_plot_data()
+    df <- pd$df
+    req(nrow(df) > 0)
+    xr <- range(c(0, df$value), na.rm = TRUE)
+    if (!is.finite(xr[2]) || xr[2] <= 0) xr[2] <- 1
+    xr[2] <- xr[2] * 1.05
+    dist_type <- if (!is.null(input$sectionDist) && identical(input$sectionDist, "Boxplot")) "box" else "hist"
+    if (identical(dist_type, "box")) {
+      top <- plotly::plot_ly(x = ~df$value, type = "box", boxpoints = "outliers", orientation = "h", source = "sectionTop") %>%
+        plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
+    } else {
+      top <- plotly::plot_ly(x = ~df$value, type = "histogram", nbinsx = 20, source = "sectionTop") %>%
+        plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
+    }
+    # Preserve label order
+    df$sec_label <- factor(df$sec_label, levels = unique(df$sec_label))
+    bars <- plotly::plot_ly(df, x = ~value, y = ~sec_label, type = "bar", orientation = "h", source = "sectionBars",
+                             marker = list(color = "#4C78A8")) %>%
+      plotly::layout(yaxis = list(title = "", categoryorder = "array", categoryarray = levels(df$sec_label)),
+                     xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
+    plotly::subplot(top, bars, nrows = 2, shareX = TRUE, heights = c(0.35, 0.65), margin = 0.02) %>%
+      plotly::layout(margin = list(l = 120, r = 20, t = 10, b = 10))
+  })
+
+  observe({
+    ev <- plotly::event_data("plotly_click", source = "sectionBars")
+    if (is.null(ev) || is.null(ev$y)) return()
+    pd <- section_plot_data(); df <- pd$df
+    lab <- as.character(ev$y)[1]
+    idx <- match(lab, as.character(df$sec_label))
+    if (is.finite(idx)) selectRows(section_proxy, idx)
+  })
+
+  # ---- NEW: Lesson charts using shared scale + ggiraph ----
+  lesson_plot_data <- reactive({
+    # Aggregate from section metrics to current level to ensure correctness above lesson
+    base <- section_metrics_display()
+    req(!is.null(base), nrow(base) > 0, input$lessonMetric)
+    m <- input$lessonMetric
+    level <- input$aggLevel %||% "lesson"
+    base[[m]] <- suppressWarnings(as.numeric(base[[m]]))
+    base <- base[is.finite(base[[m]]), , drop = FALSE]
+    if (identical(level, "lesson")) {
+      df_small <- base %>%
+        dplyr::group_by(lesson_id) %>%
+        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
+        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
+        dplyr::transmute(node = dplyr::coalesce(lesson, lesson_id), value = as.numeric(value))
+    } else {
+      if (!(level %in% names(content_tree))) return(list(df = tibble::tibble(node = character(), value = numeric()), metric_name = m))
+      df_small <- base %>%
+        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, !!rlang::sym(level)) %>% dplyr::distinct(), by = "lesson_id") %>%
+        dplyr::group_by(node = .data[[level]]) %>%
+        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
+        dplyr::mutate(value = as.numeric(value))
+    }
+    df_small <- df_small %>% dplyr::filter(is.finite(value))
+    list(df = df_small, metric_name = m)
+  })
+
+  lesson_shared_x <- reactive({
+    pd <- lesson_plot_data()
+    compute_shared_x(datasets = list(pd$df, pd$df), x_cols = c("value","value"), n_breaks = 6)
+  })
+
+  lesson_highlights <- reactive({
+    pd <- lesson_plot_data()
+    sel <- input$lessonMetricsTable_rows_selected
+    if (!is.null(sel) && length(sel) == 1 && sel >= 1 && sel <= nrow(pd$df)) pd$df$node[sel] else character(0)
+  })
+
+  output$lessonTop_gx <- ggiraph::renderGirafe({
+    pd <- lesson_plot_data()
+    if (!is.null(input$lessonDist) && identical(input$lessonDist, "Boxplot")) {
+      make_top_box_interactive(data = pd$df, x_col = "value", shared = lesson_shared_x(), left_pad_pt = 120,
+                               add_quartile_bands = TRUE, add_outliers = TRUE)
+    } else {
+      make_top_hist_interactive(data = pd$df, x_col = "value", shared = lesson_shared_x(), bins = 20, left_pad_pt = 120)
+    }
+  })
+
+  output$lessonBars_gx <- ggiraph::renderGirafe({
+    pd <- lesson_plot_data()
+    make_bottom_bars_interactive(data = pd$df, x_col = "value", label_col = "node",
+                                 shared = lesson_shared_x(), left_pad_pt = 120,
+                                 highlight_labels = lesson_highlights())
+  })
+
+  observeEvent(input$lessonBars_gx_selected, {
+    labs <- input$lessonBars_gx_selected
+    req(length(labs) >= 1)
+    pd <- lesson_plot_data()
+    idx <- match(labs[1], pd$df$node)
+    if (is.finite(idx)) selectRows(lesson_proxy, idx)
+  })
+
+  # ---- NEW: Lesson Plotly combined chart (shared x, click selects) ----
+  output$lessonPlotly <- plotly::renderPlotly({
+    pd <- lesson_plot_data()
+    df <- pd$df
+    req(nrow(df) > 0)
+    xr <- range(c(0, df$value), na.rm = TRUE)
+    dist_type <- if (!is.null(input$lessonDist) && identical(input$lessonDist, "Boxplot")) "box" else "hist"
+    if (identical(dist_type, "box")) {
+      top <- plotly::plot_ly(x = ~df$value, type = "box", boxpoints = "outliers", orientation = "h", source = "lessonTop") %>%
+        plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
+    } else {
+      top <- plotly::plot_ly(x = ~df$value, type = "histogram", nbinsx = 20, source = "lessonTop") %>%
+        plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
+    }
+    df$node <- factor(df$node, levels = unique(df$node))
+    bars <- plotly::plot_ly(df, x = ~value, y = ~node, type = "bar", orientation = "h", source = "lessonBars",
+                             marker = list(color = "#4C78A8")) %>%
+      plotly::layout(yaxis = list(title = "", categoryorder = "array", categoryarray = levels(df$node)),
+                     xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
+    plotly::subplot(top, bars, nrows = 2, shareX = TRUE, heights = c(0.35, 0.65), margin = 0.02) %>%
+      plotly::layout(margin = list(l = 120, r = 20, t = 10, b = 10))
+  })
+
+  observe({
+    ev <- plotly::event_data("plotly_click", source = "lessonBars")
+    if (is.null(ev) || is.null(ev$y)) return()
+    pd <- lesson_plot_data(); df <- pd$df
+    lab <- as.character(ev$y)[1]
+    idx <- match(lab, as.character(df$node))
+    if (is.finite(idx)) selectRows(lesson_proxy, idx)
+  })
+
   # Click on section plot to select corresponding row
   observeEvent(input$sectionPlot_click, {
     # Safe string helper to avoid closure coercion errors in diagnostics
@@ -493,6 +678,8 @@ server <- function(input, output, session) {
     updateSelectInput(session, "sectionMetric", choices = ok, selected = ok[[1]])
   })
 
+  # Legacy ggplot renderers retained earlier are now unused; safe to keep or remove.
+  # (Keeping minimal footprint by not rendering them.)
   output$sectionMetricPlot <- renderPlot({
     full_df <- section_metrics_display()
     req(!is.null(full_df), nrow(full_df) > 0, input$sectionMetric)
