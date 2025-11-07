@@ -31,8 +31,8 @@ ui <- fluidPage(
                 selectInput("sectionMetric", "Metric", choices = NULL, width = "300px"),
                 selectInput("sectionDist", "Distribution", choices = c("Boxplot","Histogram"), selected = "Boxplot", width = "200px")
               ),
-              plotOutput("sectionMetricDist", height = "240px"),
-              plotOutput("sectionMetricPlot", height = "500px", click = "sectionPlot_click")
+              plotOutput("sectionMetricDist", height = "220px"),
+              plotOutput("sectionMetricPlot", height = "480px", click = "sectionPlot_click")
             ),
             DTOutput("sectionMetricsTable")
           )
@@ -42,10 +42,11 @@ ui <- fluidPage(
             div(style = "max-width: 960px; margin: 0 auto;",
               div(style = "display:flex; gap:16px; align-items:center;",
                 selectInput("lessonMetric", "Metric", choices = NULL, width = "300px"),
+                selectInput("aggLevel", "Aggregate by", choices = NULL, width = "260px"),
                 selectInput("lessonDist", "Distribution", choices = c("Boxplot","Histogram"), selected = "Boxplot", width = "200px")
               ),
-              plotOutput("lessonMetricDist", height = "240px"),
-              plotOutput("lessonMetricPlot", height = "500px", click = "lessonPlot_click")
+              plotOutput("lessonMetricDist", height = "220px"),
+              plotOutput("lessonMetricPlot", height = "480px", click = "lessonPlot_click")
             ),
             DTOutput("lessonMetricsTable")
           )

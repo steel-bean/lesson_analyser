@@ -20,6 +20,75 @@ server <- function(input, output, session) {
   progress_info <- reactiveVal(list(done = 0L, total = 0L))
 
 
+  # Compose a distribution (top) and bars (bottom) plot with shared x-scale and aligned left axis
+  # highlight_labels: optional character vector of labels to highlight in the bar chart
+  make_dist_bars <- function(df, metric, y_title, labels, dist_type = c("Histogram","Boxplot"), rel_heights = c(1, 3), highlight_labels = NULL) {
+    dist_type <- match.arg(dist_type)
+    # Always aggregate by labels first so each bar is a single piece and the distribution reflects totals
+    label_levels <- unique(labels)
+    df <- tibble::tibble(.label = labels, .value = df[[metric]]) %>%
+      dplyr::group_by(.label) %>%
+      dplyr::summarise(.value = sum(.value, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::mutate(.ord = match(.label, label_levels)) %>%
+      dplyr::arrange(.ord) %>%
+      dplyr::mutate(.highlight = if (!is.null(highlight_labels)) .label %in% highlight_labels else FALSE)
+    x_max <- suppressWarnings(max(df$.value, na.rm = TRUE)); if (!is.finite(x_max) || x_max <= 0) x_max <- 1
+
+    # Bars (bottom)
+    # Precompute y factor with labels to avoid NSE warnings and enable label-based clicks
+    df$y_factor <- factor(df$.label, levels = label_levels)
+    p_bars <- ggplot2::ggplot(
+      df, ggplot2::aes(x = .data[[".value"]], y = .data[["y_factor"]], fill = .data[[".highlight"]])
+    ) +
+      ggplot2::geom_col(color = "white") +
+      ggplot2::scale_fill_manual(values = c(`FALSE` = "#4C78A8", `TRUE` = "#d62728"), guide = "none") +
+      ggplot2::labs(x = metric, y = y_title) +
+      ggplot2::coord_cartesian(xlim = c(0, x_max)) +
+      ggplot2::theme_minimal(base_size = 12)
+
+    # Distribution (top)
+    if (identical(dist_type, "Boxplot")) {
+      p_dist <- ggplot2::ggplot(df, ggplot2::aes(x = .data[[".value"]], y = 1)) +
+        ggplot2::geom_boxplot(fill = "#999999", color = "#555555") +
+        ggplot2::labs(x = metric, y = NULL) +
+        ggplot2::coord_cartesian(xlim = c(0, x_max)) +
+        ggplot2::theme_minimal(base_size = 12) +
+        ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank())
+    } else {
+      p_dist <- ggplot2::ggplot(df, ggplot2::aes(x = .data[[".value"]])) +
+        ggplot2::geom_histogram(bins = 20, fill = "#999999", color = "#555555") +
+        ggplot2::labs(x = metric, y = NULL) +
+        ggplot2::coord_cartesian(xlim = c(0, x_max)) +
+        ggplot2::theme_minimal(base_size = 12) +
+        ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank())
+    }
+
+    aligned <- cowplot::align_plots(p_dist, p_bars, align = "v", axis = "l")
+    cowplot::plot_grid(aligned[[1]], aligned[[2]], ncol = 1, rel_heights = rel_heights)
+  }
+
+  # Bars-only helper in the same label order
+  make_bars_only <- function(df, metric, y_title, labels, highlight_labels = NULL) {
+    label_levels <- unique(labels)
+    df <- tibble::tibble(.label = labels, .value = df[[metric]]) %>%
+      dplyr::group_by(.label) %>%
+      dplyr::summarise(.value = sum(.value, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::mutate(.ord = match(.label, label_levels)) %>%
+      dplyr::arrange(.ord) %>%
+      dplyr::mutate(.highlight = if (!is.null(highlight_labels)) .label %in% highlight_labels else FALSE)
+    x_max <- suppressWarnings(max(df$.value, na.rm = TRUE)); if (!is.finite(x_max) || x_max <= 0) x_max <- 1
+    df$y_factor <- factor(df$.label, levels = label_levels)
+    ggplot2::ggplot(
+      df, ggplot2::aes(x = .data[[".value"]], y = .data[["y_factor"]], fill = .data[[".highlight"]])
+    ) +
+      ggplot2::geom_col(color = "white") +
+      ggplot2::scale_fill_manual(values = c(`FALSE` = "#4C78A8", `TRUE` = "#d62728"), guide = "none") +
+      ggplot2::labs(x = metric, y = y_title) +
+      ggplot2::coord_cartesian(xlim = c(0, x_max)) +
+      ggplot2::theme_minimal(base_size = 12)
+  }
+
+
   # Helper: bin a numeric vector and flag the bin containing a selected value
   bin_counts_df <- function(x, bins = 30, sel_val = NA_real_) {
     x <- x[is.finite(x)]
@@ -298,40 +367,41 @@ server <- function(input, output, session) {
     }
     full_df <- section_metrics_display()
     req(!is.null(full_df), nrow(full_df) > 0, input$sectionMetric)
+    m <- input$sectionMetric
     # Filter exactly as the plot: keep only sections with positive words_total
     df <- full_df %>% dplyr::filter(is.finite(words_total) & words_total > 0)
     req(nrow(df) > 0)
     if (!("section_index" %in% names(df)) || all(is.na(df$section_index))) df$section_index <- seq_len(nrow(df))
-    df$sec_label <- paste0(df$lesson_id, "-", df$section_index)
+    df <- df %>% dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson) %>% dplyr::distinct(), by = "lesson_id")
+    df$sec_label <- paste0(df$lesson, "-", df$section_index)
+    # Build the same aggregated frame used for plotting, preserving incoming label order
+    label_levels <- unique(df$sec_label)
+    plot_df <- df %>%
+      dplyr::group_by(sec_label) %>%
+      dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
+      dplyr::mutate(.ord = match(sec_label, label_levels)) %>%
+      dplyr::arrange(.ord)
+
     # Log raw click event for diagnostics
     { cx <- input$sectionPlot_click$x; cy <- input$sectionPlot_click$y; message(paste0("Section raw click → x: ", sc(cx), ", y: ", sc(cy))) }
-    # Try by label first, then nearPoints in plotted space, then numeric fallback
-    hit <- NA_integer_
+
+    # Resolve clicked label
+    ylab <- NULL
     if (is.character(input$sectionPlot_click$y)) {
       ylab <- input$sectionPlot_click$y
-      if (!is.na(ylab) && ylab %in% df$sec_label) hit <- which(df$sec_label == ylab)[1]
-    }
-    if (!is.finite(hit) || is.na(hit)) {
-      df$.ord <- seq_len(nrow(df))
-      df$y_index <- as.integer(factor(df$.ord, levels = rev(df$.ord)))
-      np <- try(nearPoints(df, input$sectionPlot_click, xvar = m, yvar = "y_index", maxpoints = 1, threshold = 40, addDist = FALSE), silent = TRUE)
-      if (!inherits(np, "try-error") && is.data.frame(np) && nrow(np) == 1) {
-        hit <- which(df$lesson_id == np$lesson_id & df$section_index == np$section_index)[1]
-      }
-    }
-    if (!is.finite(hit) || is.na(hit)) {
-      df$.ord <- seq_len(nrow(df))
-      nlev <- nrow(df)
+    } else {
+      # Map numeric y to nearest row index (discrete y uses 1..N in plot order from bottom to top)
       ynum <- suppressWarnings(as.numeric(input$sectionPlot_click$y))
       if (is.finite(ynum)) {
-        idx_in_levels <- as.integer(round(ynum))
-        if (idx_in_levels >= 1 && idx_in_levels <= nlev) {
-          clicked_ord <- rev(df$.ord)[idx_in_levels]
-          cand <- which(df$.ord == clicked_ord)
-          if (length(cand) >= 1) hit <- cand[1]
-        }
+        idx <- as.integer(round(ynum))
+        idx <- max(1L, min(idx, nrow(plot_df)))
+        ylab <- plot_df$sec_label[idx]
       }
     }
+    req(!is.null(ylab), is.character(ylab), length(ylab) == 1, !is.na(ylab))
+
+    # Map label back to a concrete section row; then to full table index
+    hit <- which(df$sec_label == ylab)[1]
     req(is.finite(hit), !is.na(hit), hit >= 1, hit <= nrow(df))
     # Console diagnostics of what was clicked
     m <- input$sectionMetric
@@ -363,37 +433,36 @@ server <- function(input, output, session) {
         as.character(x)
       }, error = function(e) paste0("<", class(x)[1], ">"))
     }
-    df <- lesson_metrics()
+    df <- agg_metrics()
     req(!is.null(df), nrow(df) > 0, input$lessonMetric)
+    m <- input$lessonMetric
+    # Build the same aggregated frame used for plotting, preserving incoming label order
+    label_levels <- unique(df$node)
+    plot_df <- df %>%
+      dplyr::group_by(node) %>%
+      dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
+      dplyr::mutate(.ord = match(node, label_levels)) %>%
+      dplyr::arrange(.ord)
+
     # Log raw click event for diagnostics
     { cx <- input$lessonPlot_click$x; cy <- input$lessonPlot_click$y; message(paste0("Lesson raw click → x: ", sc(cx), ", y: ", sc(cy))) }
-    # Try label first, then nearPoints, then numeric fallback
-    hit <- NA_integer_
+
+    # Resolve clicked label
+    ylab <- NULL
     if (is.character(input$lessonPlot_click$y)) {
       ylab <- input$lessonPlot_click$y
-      if (!is.na(ylab) && ylab %in% df$lesson_id) hit <- which(df$lesson_id == ylab)[1]
-    }
-    if (!is.finite(hit) || is.na(hit)) {
-      df$.ord <- seq_len(nrow(df))
-      df$y_index <- as.integer(factor(df$.ord, levels = rev(df$.ord)))
-      np <- try(nearPoints(df, input$lessonPlot_click, xvar = m, yvar = "y_index", maxpoints = 1, threshold = 40, addDist = FALSE), silent = TRUE)
-      if (!inherits(np, "try-error") && is.data.frame(np) && nrow(np) == 1) {
-        hit <- which(df$lesson_id == np$lesson_id)[1]
-      }
-    }
-    if (!is.finite(hit) || is.na(hit)) {
-      df$.ord <- seq_len(nrow(df))
-      nlev <- nrow(df)
+    } else {
+      # Map numeric y to nearest row index (discrete y uses 1..N in plot order from bottom to top)
       ynum <- suppressWarnings(as.numeric(input$lessonPlot_click$y))
       if (is.finite(ynum)) {
-        idx_in_levels <- as.integer(round(ynum))
-        if (idx_in_levels >= 1 && idx_in_levels <= nlev) {
-          clicked_ord <- rev(df$.ord)[idx_in_levels]
-          cand <- which(df$.ord == clicked_ord)
-          if (length(cand) >= 1) hit <- cand[1]
-        }
+        idx <- as.integer(round(ynum))
+        idx <- max(1L, min(idx, nrow(plot_df)))
+        ylab <- plot_df$node[idx]
       }
     }
+    req(!is.null(ylab), is.character(ylab), length(ylab) == 1, !is.na(ylab))
+
+    hit <- which(df$node == ylab)[1]
     req(is.finite(hit), !is.na(hit), hit >= 1, hit <= nrow(df))
     # Console diagnostics of what was clicked
     m <- input$lessonMetric
@@ -440,32 +509,18 @@ server <- function(input, output, session) {
     req(nrow(df) > 0)
     # order by current (filtered) table order
     df$.ord <- seq_len(nrow(df))
-    # section label: [lesson_id]-[section_index]
+    # Build labels using lesson title instead of id: [lesson]-[section_index]
     if (!("section_index" %in% names(df)) || all(is.na(df$section_index))) df$section_index <- seq_len(nrow(df))
-    df$sec_label <- paste0(df$lesson_id, "-", df$section_index)
+    df <- df %>% dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson) %>% dplyr::distinct(), by = "lesson_id")
+    df$sec_label <- paste0(df$lesson, "-", df$section_index)
     # Highlight if selected row remains after filtering
     df$highlight <- FALSE
     if (!is.null(sel_key)) {
       hit <- which(df$lesson_id == sel_key$lesson_id & df$section_index == sel_key$section_index)
       if (length(hit) == 1) df$highlight[hit] <- TRUE
     }
-    # Compute common x-range to align with the box plot
-    x_max <- suppressWarnings(max(df[[m]], na.rm = TRUE))
-    if (!is.finite(x_max) || x_max <= 0) x_max <- 1
-    # Base bars only; distribution rendered in sectionMetricDist
-    sec_labels <- rev(df$sec_label)
-    # Compute left margin to align with distribution panel
-    if (!("section_index" %in% names(df)) || all(is.na(df$section_index))) df$section_index <- seq_len(nrow(df))
-    sec_label_chars <- nchar(paste0(df$lesson_id, "-", df$section_index))
-    l_margin <- 8 + 7 * max(sec_label_chars, na.rm = TRUE) - 35  # add tick/padding offset
-    p <- ggplot2::ggplot(df, ggplot2::aes(x = .data[[m]], y = factor(.ord, levels = rev(.ord), labels = sec_labels), fill = highlight)) +
-      ggplot2::geom_col(color = "white") +
-      ggplot2::scale_fill_manual(values = c(`TRUE` = "#d62728", `FALSE` = "#7aa6c2"), guide = "none") +
-      ggplot2::labs(x = m, y = "section") +
-      ggplot2::coord_cartesian(xlim = c(0, x_max)) +
-      ggplot2::theme_minimal(base_size = 12) +
-      ggplot2::theme(plot.margin = ggplot2::margin(t = 5, r = 5, b = 5, l = l_margin, unit = "pt"))
-    p
+    highlight_labels <- df$sec_label[df$highlight]
+    make_bars_only(df = df, metric = m, y_title = "section", labels = df$sec_label, highlight_labels = highlight_labels)
   })
 
   # Section distribution (always shown above bars)
@@ -586,7 +641,7 @@ server <- function(input, output, session) {
   })
 
   output$lessonMetricsTable <- renderDT({
-    df <- lesson_metrics()
+    df <- agg_metrics()
     if (is.null(df) || nrow(df) == 0) {
       return(datatable(data.frame()))
     }
@@ -607,50 +662,117 @@ server <- function(input, output, session) {
   )
 
   observe({
-    df <- lesson_metrics()
+    df <- agg_metrics()
     if (is.null(df) || nrow(df) == 0) return()
     ok <- intersect(numeric_metric_names, names(df))
     if (length(ok) == 0) return()
     updateSelectInput(session, "lessonMetric", choices = ok, selected = ok[[1]])
   })
 
+  # Populate aggregate level choices from content_tree (Level 0-3)
+  observe({
+    level_order <- c("course","module","chapter","lesson")
+    present <- intersect(level_order, names(content_tree))
+    if (length(present) == 0) return()
+    level_index <- match(present, level_order) - 1L
+    labels <- paste0("Level ", level_index, " - ", stringr::str_to_title(present))
+    choices <- present; names(choices) <- labels
+    default <- if ("lesson" %in% present) "lesson" else present[[length(present)]]
+    updateSelectInput(session, "aggLevel", choices = choices, selected = default)
+  })
+
+  # Aggregated metrics by selected level
+  agg_metrics <- reactive({
+    level <- input$aggLevel %||% "lesson"
+    les <- lesson_metrics()
+    if (is.null(les) || nrow(les) == 0) return(tibble::tibble())
+    # Ensure heading-by-level cols exist
+    ensure_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6")
+    for (nm in setdiff(ensure_cols, names(les))) les[[nm]] <- 0L
+    if (identical(level, "lesson")) {
+      # Use lesson title for labels instead of lesson_id; fall back to id if title absent
+      if ("lesson" %in% names(les)) {
+        out <- les %>% dplyr::mutate(node = .data[["lesson"]]) %>% dplyr::relocate(node, .after = lesson_id)
+      } else {
+        out <- les %>%
+          dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
+          dplyr::mutate(node = .data[["lesson"]]) %>%
+          dplyr::relocate(node, .after = lesson_id)
+      }
+      return(out)
+    }
+    if (!(level %in% names(content_tree))) return(tibble::tibble())
+    join <- content_tree %>% dplyr::select(lesson_id, !!rlang::sym(level)) %>% dplyr::distinct()
+    out <- les %>%
+      dplyr::left_join(join, by = "lesson_id") %>%
+      dplyr::group_by(.data[[level]]) %>%
+      dplyr::summarise(
+        plaintext = stringr::str_trunc(stringr::str_squish(paste(plaintext, collapse = " ")), 100),
+        words_total = sum(words_total, na.rm = TRUE),
+        words_nomath = sum(words_nomath, na.rm = TRUE),
+        chars_total = sum(chars_total, na.rm = TRUE),
+        sentences_nomath = sum(sentences_nomath, na.rm = TRUE),
+        blocks_total = sum(blocks_total, na.rm = TRUE),
+        words_sum = sum(words_sum, na.rm = TRUE),
+        headings_count = sum(headings_count, na.rm = TRUE),
+        headings_h1 = sum(headings_h1, na.rm = TRUE),
+        headings_h2 = sum(headings_h2, na.rm = TRUE),
+        headings_h3 = sum(headings_h3, na.rm = TRUE),
+        headings_h6 = sum(headings_h6, na.rm = TRUE),
+        images_count = sum(images_count, na.rm = TRUE),
+        tables_count = sum(tables_count, na.rm = TRUE),
+        lists_count = sum(lists_count, na.rm = TRUE),
+        latex_total = sum(latex_total, na.rm = TRUE),
+        latex_inline = sum(latex_inline, na.rm = TRUE),
+        latex_display = sum(latex_display, na.rm = TRUE),
+        latex_display_multi = sum(latex_display_multi, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      dplyr::rename(node = !!rlang::sym(level)) %>%
+      # Order by parent then by node (alphabetical fallback)
+      {
+        parent_col <- dplyr::case_when(
+          level == "lesson"  ~ "chapter",
+          level == "chapter" ~ "module",
+          level == "module"  ~ "course",
+          TRUE ~ NA_character_
+        )
+        if (!is.na(parent_col) && parent_col %in% names(content_tree)) {
+          dplyr::left_join(., content_tree %>% dplyr::select(lesson_id, !!rlang::sym(level), !!rlang::sym(parent_col)) %>% dplyr::distinct(),
+                           by = stats::setNames(level, "node")) %>%
+            dplyr::rename(parent = !!rlang::sym(parent_col)) %>%
+            dplyr::arrange(parent, node) %>%
+            dplyr::select(-parent)
+        } else {
+          dplyr::arrange(., node)
+        }
+      }
+    out
+  })
+
   output$lessonMetricPlot <- renderPlot({
-    df <- lesson_metrics()
+    df <- agg_metrics()
     req(!is.null(df), nrow(df) > 0, input$lessonMetric)
     m <- input$lessonMetric
     req(m %in% names(df))
-    df$.ord <- seq_len(nrow(df))
+    labels <- df$node
+    ylab <- (input$aggLevel %||% "lesson")
+    # Highlight currently selected row in the lesson table
     sel <- input$lessonMetricsTable_rows_selected
-    df$highlight <- FALSE
-    if (!is.null(sel) && length(sel) == 1 && sel >= 1 && sel <= nrow(df)) df$highlight[sel] <- TRUE
-    lesson_labels <- rev(df$lesson_id)
-    x_max <- suppressWarnings(max(df[[m]], na.rm = TRUE))
-    if (!is.finite(x_max) || x_max <= 0) x_max <- 1
-    # Base bars only; distribution rendered in lessonMetricDist
-    # Compute left margin to align with distribution panel
-    lesson_label_chars <- nchar(lesson_labels)
-    l_margin <- 8 + 7 * max(lesson_label_chars, na.rm = TRUE) - 35
-    l_margin <- max(0, min(l_margin, 220))
-    p <- ggplot2::ggplot(df, ggplot2::aes(x = .data[[m]], y = factor(.ord, levels = rev(.ord), labels = lesson_labels), fill = highlight)) +
-      ggplot2::geom_col(color = "white") +
-      ggplot2::scale_fill_manual(values = c(`TRUE` = "#d62728", `FALSE` = "#4C78A8"), guide = "none") +
-      ggplot2::labs(x = m, y = "lesson_id") +
-      ggplot2::coord_cartesian(xlim = c(0, x_max)) +
-      ggplot2::theme_minimal(base_size = 12) +
-      ggplot2::theme(plot.margin = ggplot2::margin(t = 5, r = 5, b = 5, l = l_margin, unit = "pt"))
-    p
+    highlight_labels <- if (!is.null(sel) && length(sel) == 1 && sel >= 1 && sel <= nrow(df)) labels[sel] else character(0)
+    make_bars_only(df = df, metric = m, y_title = ylab, labels = labels, highlight_labels = highlight_labels)
   })
 
   # Lesson distribution (always shown above bars)
   output$lessonMetricDist <- renderPlot({
-    df <- lesson_metrics()
+    df <- agg_metrics()
     req(!is.null(df), nrow(df) > 0, input$lessonMetric)
     m <- input$lessonMetric
     req(m %in% names(df))
     x_max <- suppressWarnings(max(df[[m]], na.rm = TRUE))
     if (!is.finite(x_max) || x_max <= 0) x_max <- 1
     # Approximate left margin based on lesson_id label widths in bar plot
-    lesson_label_chars <- nchar(df$lesson_id)
+    lesson_label_chars <- nchar(df$node)
     l_margin <- 8 + 7 * max(lesson_label_chars, na.rm = TRUE) - 35
     # Manual alignment tweak for distribution panel (increase to move right)
     dist_left_tweak <- 38

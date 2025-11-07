@@ -33,6 +33,7 @@ library(tictoc)
 # plotting layout
 library(patchwork)
 library(ggExtra)
+library(cowplot)
 
 # Optional side-panel geoms for distributions
 ggside_available <- requireNamespace("ggside", quietly = TRUE)
