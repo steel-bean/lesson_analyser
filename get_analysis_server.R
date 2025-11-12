@@ -379,6 +379,14 @@ server <- function(input, output, session) {
   # Selection/filter state driven by Plotly interactions
   section_filter <- reactiveVal(NULL)  # list(type="labels"| "range", values=c(...))
   lesson_filter  <- reactiveVal(NULL)
+  # Global selected member labels (nodes) shared across tabs (supports multi-select)
+  selected_members <- reactiveVal(character(0))
+  # Event signatures to avoid re-processing the same UI events after re-render
+  ev_sigs <- reactiveValues(
+    lesson_sel = "", lesson_clk = "",
+    metric_sel = "", metric_clk = "",
+    bench_sel  = "", bench_clk  = ""
+  )
 
   # Helper to safely read plotly event_data without warnings when not registered yet
   safe_event_data <- function(event, source_id) {
@@ -463,8 +471,10 @@ server <- function(input, output, session) {
     }
     # Preserve label order
     df$sec_label <- factor(df$sec_label, levels = unique(df$sec_label))
+    # Match group analysis border behavior: remove borders if many bars
+    line_w_sec <- if (nrow(df) > 15) 0 else 0.5
     bars <- plotly::plot_ly(df, x = ~value, y = ~sec_label, type = "bar", orientation = "h",
-                             marker = list(color = "#D1C8F1", line = list(color = "black", width = 0.5))) %>%
+                             marker = list(color = "#D1C8F1", line = list(color = "black", width = line_w_sec))) %>%
       plotly::layout(yaxis = list(title = "", categoryorder = "array", categoryarray = levels(df$sec_label)),
                      xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
     plt <- plotly::subplot(top, bars, nrows = 2, shareX = TRUE, heights = c(0.35, 0.65), margin = 0.02) %>%
@@ -539,9 +549,16 @@ server <- function(input, output, session) {
   })
 
   lesson_highlights <- reactive({
+    # Prefer global selected members, fallback to table selection
+    labs <- selected_members()
+    if (length(labs) > 0) return(labs)
     pd <- lesson_plot_data()
     sel <- input$lessonMetricsTable_rows_selected
-    if (!is.null(sel) && length(sel) == 1 && sel >= 1 && sel <= nrow(pd$df)) pd$df$node[sel] else character(0)
+    if (!is.null(sel) && length(sel) >= 1) {
+      sel <- sel[sel >= 1 & sel <= nrow(pd$df)]
+      if (length(sel)) return(pd$df$node[sel])
+    }
+    character(0)
   })
 
   output$lessonTop_gx <- ggiraph::renderGirafe({
@@ -586,6 +603,7 @@ server <- function(input, output, session) {
         # Place each group's box on its own y category so the label appears on the left
         top <- top %>% plotly::add_trace(x = sub$value, y = rep(g, nrow(sub)), type = "box", boxpoints = "outliers",
                                          orientation = "h", name = g, fillcolor = unname(pal[g]),
+                                         key = sub$node,
                                          marker = list(color = unname(pal[g]), line = list(color = "black", width = 0.5)),
                                          line = list(color = "black", width = 0.5))
       }
@@ -600,7 +618,15 @@ server <- function(input, output, session) {
         sub <- df[df$grp %in% g | (!"grp" %in% names(df)), , drop = FALSE]
         top <- top %>% plotly::add_trace(x = sub$value, type = "histogram", nbinsx = 20, name = g,
                                          marker = list(color = unname(pal[g]), line = list(color = "black", width = 0.5)),
-                                         opacity = 0.6)
+                                         opacity = 0.6, hoverinfo = "skip", showlegend = TRUE)
+        if (nrow(sub)) {
+          top <- top %>% plotly::add_trace(
+            x = sub$value, y = stats::runif(nrow(sub), -0.05, 0.05),
+            type = "scatter", mode = "markers", name = paste0(g, " (select)"),
+            key = sub$node, showlegend = FALSE, hoverinfo = "skip",
+            marker = list(size = 14, color = "rgba(0,0,0,0.01)")
+          )
+        }
       }
       top <- top %>% plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])),
                                     barmode = "overlay", showlegend = TRUE)
@@ -608,8 +634,15 @@ server <- function(input, output, session) {
     df$node <- factor(df$node, levels = unique(df$node))
     bar_colors <- if ("grp" %in% names(df)) pal[as.character(df$grp)] else rep("#D1C8F1", nrow(df))
     bar_colors[is.na(bar_colors)] <- "#D1C8F1"
-    bars <- plotly::plot_ly(df, x = ~value, y = ~node, type = "bar", orientation = "h",
-                             marker = list(color = bar_colors, line = list(color = "black", width = 0.5))) %>%
+    # Highlight selected bars in black (supports multi-select)
+    sel_labels <- lesson_highlights()
+    if (length(sel_labels) >= 1) {
+      hits <- which(as.character(df$node) %in% sel_labels)
+      if (length(hits) >= 1) bar_colors[hits] <- "black"
+    }
+    line_w <- if (nrow(df) > 15) 0 else 0.5
+    bars <- plotly::plot_ly(df, x = ~value, y = ~node, key = ~as.character(node), type = "bar", orientation = "h",
+                             marker = list(color = bar_colors, line = list(color = "black", width = line_w))) %>%
       plotly::layout(yaxis = list(title = "", categoryorder = "array", categoryarray = levels(df$node)),
                      xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
     plt <- plotly::subplot(top, bars, nrows = 2, shareX = TRUE, heights = c(0.35, 0.65), margin = 0.02) %>%
@@ -622,7 +655,8 @@ server <- function(input, output, session) {
           'hoverClosestCartesian','hoverCompareCartesian','toggleSpikelines'
         )
       )
-    plt <- plt %>% plotly::event_register('plotly_selected') %>% plotly::event_register('plotly_click')
+    plt <- plt %>% plotly::event_register('plotly_selected') %>% plotly::event_register('plotly_click') %>%
+      plotly::event_register('plotly_doubleclick') %>% plotly::event_register('plotly_deselect')
     plt$x$source <- 'lessonBars'
     plt
   })
@@ -670,18 +704,22 @@ server <- function(input, output, session) {
 
   # Helper: build number line per rules for a metric
   build_benchmark_plot <- function(df, metric_name) {
-    # Determine selected labels from plot selection or table selection
-    sel_ev  <- safe_event_data('plotly_selected', 'lessonBars')
-    click_ev <- safe_event_data('plotly_click', 'lessonBars')
+    # Use global selected members if present; otherwise derive from events/table
+    sel_labs <- selected_members()
     sel_labels <- character(0)
-    if (!is.null(sel_ev) && NROW(sel_ev)) {
-      sel_labels <- unique(as.character(sel_ev$y))
-    } else if (!is.null(click_ev) && !is.null(click_ev$y)) {
-      sel_labels <- as.character(click_ev$y[1])
+    if (length(sel_labs) > 0) {
+      sel_labels <- sel_labs
     } else {
-      # fallback to table selection
-      row <- input$lessonMetricsTable_rows_selected
-      if (!is.null(row) && length(row) == 1 && row >= 1 && row <= nrow(df)) sel_labels <- df$node[row]
+      sel_ev  <- safe_event_data('plotly_selected', 'lessonBars')
+      click_ev <- safe_event_data('plotly_click', 'lessonBars')
+      if (!is.null(sel_ev) && NROW(sel_ev)) {
+        sel_labels <- unique(as.character(sel_ev$y))
+      } else if (!is.null(click_ev) && !is.null(click_ev$y)) {
+        sel_labels <- as.character(click_ev$y[1])
+      } else {
+        row <- input$lessonMetricsTable_rows_selected
+        if (!is.null(row) && length(row) == 1 && row >= 1 && row <= nrow(df)) sel_labels <- df$node[row]
+      }
     }
     # Build number line per rules
     xr <- range(c(0, df$value), na.rm = TRUE); if (!is.finite(xr[2]) || xr[2] <= 0) xr[2] <- 1; xr[2] <- xr[2] * 1.05
@@ -727,12 +765,14 @@ server <- function(input, output, session) {
       # show all dots + median line (+ optional mean)
       if (nrow(peers_df)) {
         p <- p %>% plotly::add_trace(data = peers_df, x = ~value, y = ~y, type = 'scatter', mode = 'markers',
+                                     key = ~node,
                                      marker = list(color = '#D1C8F1', size = 10, line = list(color = 'black', width = 0.2)),
                                      hoverinfo = 'text',
                                      text = ~paste0(peers_df$node, ': ', signif(peers_df$value, 5)))
       }
       if (nrow(selected_df)) {
         p <- p %>% plotly::add_trace(data = selected_df, x = ~value, y = ~y, type = 'scatter', mode = 'markers',
+                                     key = ~node,
                                      marker = list(color = 'black', size = 12, line = list(color = 'black', width = 0.6)),
                                      hoverinfo = 'text',
                                      text = ~paste0(selected_df$node, ' (selected): ', signif(selected_df$value, 5)))
@@ -758,12 +798,14 @@ server <- function(input, output, session) {
       tails <- peers_df %>% dplyr::filter((is.finite(q[1]) & value < q[1]) | (is.finite(q[3]) & value > q[3]))
       if (nrow(tails)) {
         p <- p %>% plotly::add_trace(data = tails, x = ~value, y = ~y, type = 'scatter', mode = 'markers',
+                                     key = ~node,
                                      marker = list(color = '#D1C8F1', size = 10, line = list(color = 'black', width = 0.2)),
                                      hoverinfo = 'text',
                                      text = ~paste0(tails$node, ': ', signif(tails$value, 5)))
       }
       if (nrow(selected_df)) {
         p <- p %>% plotly::add_trace(data = selected_df, x = ~value, y = ~y, type = 'scatter', mode = 'markers',
+                                     key = ~node,
                                      marker = list(color = 'black', size = 12, line = list(color = 'black', width = 0.6)),
                                      hoverinfo = 'text',
                                      text = ~paste0(selected_df$node, ' (selected): ', signif(selected_df$value, 5)))
@@ -778,6 +820,7 @@ server <- function(input, output, session) {
                                    line = list(color = "black", width = 1))
       if (nrow(selected_df)) {
         p <- p %>% plotly::add_trace(data = selected_df, x = ~value, y = ~y, type = 'scatter', mode = 'markers',
+                                     key = ~node,
                                      marker = list(color = 'black', size = 12, line = list(color = 'black', width = 0.6)),
                                      hoverinfo = 'text',
                                      text = ~paste0(selected_df$node, ' (selected): ', signif(selected_df$value, 5)))
@@ -809,7 +852,13 @@ server <- function(input, output, session) {
         output[[paste0("benchmarkPlot_", metric)]] <- plotly::renderPlotly({
           df <- get_group_values(metric)
           req(nrow(df) > 0)
-          build_benchmark_plot(df, metric)
+          p <- build_benchmark_plot(df, metric) %>%
+            plotly::event_register('plotly_click') %>%
+            plotly::event_register('plotly_selected') %>%
+            plotly::event_register('plotly_doubleclick') %>%
+            plotly::event_register('plotly_deselect')
+          p$x$source <- 'benchmark'
+          p
         })
       })
     }
@@ -838,16 +887,21 @@ server <- function(input, output, session) {
     })
     wide <- Reduce(function(a, b) dplyr::full_join(a, b, by = "node"), dfs)
     # Determine selection
-    sel_ev  <- safe_event_data('plotly_selected', 'lessonBars')
-    click_ev <- safe_event_data('plotly_click', 'lessonBars')
+    sel_labs <- selected_members()
     sel_labels <- character(0)
-    if (!is.null(sel_ev) && NROW(sel_ev)) {
-      sel_labels <- unique(as.character(sel_ev$y))
-    } else if (!is.null(click_ev) && !is.null(click_ev$y)) {
-      sel_labels <- as.character(click_ev$y[1])
+    if (length(sel_labs) > 0) {
+      sel_labels <- sel_labs
     } else {
-      row <- input$lessonMetricsTable_rows_selected
-      if (!is.null(row) && length(row) == 1 && row >= 1 && row <= nrow(wide)) sel_labels <- wide$node[row]
+      sel_ev  <- safe_event_data('plotly_selected', 'lessonBars')
+      click_ev <- safe_event_data('plotly_click', 'lessonBars')
+      if (!is.null(sel_ev) && NROW(sel_ev)) {
+        sel_labels <- unique(as.character(sel_ev$y))
+      } else if (!is.null(click_ev) && !is.null(click_ev$y)) {
+        sel_labels <- as.character(click_ev$y[1])
+      } else {
+        row <- input$lessonMetricsTable_rows_selected
+        if (!is.null(row) && length(row) == 1 && row >= 1 && row <= nrow(wide)) sel_labels <- wide$node[row]
+      }
     }
     wide$.selected <- wide$node %in% sel_labels
     k <- length(mets)
@@ -867,12 +921,14 @@ server <- function(input, output, session) {
           if (nrow(peers)) {
             p <- p %>% plotly::add_trace(data = peers, x = peers[[xmet]], y = peers[[ymet]], type = 'scatter', mode = 'markers',
                                          marker = list(color = '#D1C8F1', size = 7, line = list(color = 'black', width = 0.2)),
+                                         key = peers$node,
                                          hoverinfo = 'text',
                                          text = ~paste0(peers$node, '<br>', xmet, ': ', signif(peers[[xmet]], 5), '<br>', ymet, ': ', signif(peers[[ymet]], 5)))
           }
           if (nrow(sels)) {
             p <- p %>% plotly::add_trace(data = sels, x = sels[[xmet]], y = sels[[ymet]], type = 'scatter', mode = 'markers',
                                          marker = list(color = 'black', size = 9, line = list(color = 'black', width = 0.6)),
+                                         key = sels$node,
                                          hoverinfo = 'text',
                                          text = ~paste0(sels$node, ' (selected)<br>', xmet, ': ', signif(sels[[xmet]], 5), '<br>', ymet, ': ', signif(sels[[ymet]], 5)))
           }
@@ -884,25 +940,144 @@ server <- function(input, output, session) {
     }
     h <- 220 * k
     subplot <- plotly::subplot(plots, nrows = k, shareX = FALSE, shareY = FALSE, margin = 0.02) %>%
-      plotly::layout(margin = list(l = 60, r = 20, t = 10, b = 40), showlegend = FALSE)
+      plotly::layout(margin = list(l = 60, r = 20, t = 10, b = 40), showlegend = FALSE) %>%
+      plotly::event_register('plotly_click') %>%
+      plotly::event_register('plotly_selected') %>%
+      plotly::event_register('plotly_doubleclick') %>%
+      plotly::event_register('plotly_deselect')
+    subplot$x$source <- 'metricMatrix'
     subplot$sizingPolicy$defaultHeight <- h
     subplot
   })
 
+  # Clicking/Selecting in the metric matrix updates global selection
+  observe({
+    ev <- safe_event_data('plotly_click', 'metricMatrix')
+    if (is.null(ev) || is.null(ev$key)) return()
+    lab <- as.character(ev$key)[1]
+    if (!is.null(lab) && nchar(lab)) {
+      sig <- paste0("MC|", lab)
+      if (!identical(sig, ev_sigs$metric_clk)) {
+        ev_sigs$metric_clk <- sig
+        cur <- isolate(selected_members())
+        if (lab %in% cur) cur <- setdiff(cur, lab) else cur <- sort(unique(c(cur, lab)))
+        selected_members(cur)
+        lesson_filter(list(type = "labels", values = cur))
+      }
+    }
+  })
+  observe({
+    sel <- safe_event_data('plotly_selected', 'metricMatrix')
+    if (is.null(sel) || !NROW(sel) || is.null(sel$key)) return()
+    labs <- unique(as.character(sel$key))
+    sig <- paste0("MS|", paste(sort(labs), collapse = "|"))
+    if (!identical(sig, ev_sigs$metric_sel)) {
+      ev_sigs$metric_sel <- sig
+      cur <- isolate(selected_members())
+      new_sel <- sort(unique(c(cur, labs)))
+      if (!setequal(new_sel, cur)) {
+        selected_members(new_sel)
+        lesson_filter(list(type = "labels", values = new_sel))
+      }
+    }
+  })
+
+  # Deselect on background click/doubleclick in Group analysis
+  observe({
+    ev <- safe_event_data('plotly_doubleclick', 'lessonBars')
+    de <- safe_event_data('plotly_deselect', 'lessonBars')
+    if (!is.null(ev) || !is.null(de)) {
+      lesson_filter(NULL)
+      selected_members(character(0))
+      selectRows(lesson_proxy, integer(0))
+    }
+  })
+
+  # Deselect on background click/doubleclick in Metric analysis
+  observe({
+    ev <- safe_event_data('plotly_doubleclick', 'metricMatrix')
+    de <- safe_event_data('plotly_deselect', 'metricMatrix')
+    if (!is.null(ev) || !is.null(de)) {
+      lesson_filter(NULL)
+      selected_members(character(0))
+      selectRows(lesson_proxy, integer(0))
+    }
+  })
+
+  # Benchmark interactions: toggle on click, union on box-select, clear on deselect/dblclick
+  observe({
+    clk <- safe_event_data('plotly_click', 'benchmark')
+    if (is.null(clk) || is.null(clk$key)) return()
+    lab <- as.character(clk$key)[1]
+    if (!is.null(lab) && nchar(lab)) {
+      sig <- paste0("BC|", lab)
+      if (!identical(sig, ev_sigs$bench_clk)) {
+        ev_sigs$bench_clk <- sig
+        cur <- isolate(selected_members())
+        if (lab %in% cur) cur <- setdiff(cur, lab) else cur <- sort(unique(c(cur, lab)))
+        selected_members(cur)
+        lesson_filter(list(type = "labels", values = cur))
+      }
+    }
+  })
+  observe({
+    sel <- safe_event_data('plotly_selected', 'benchmark')
+    if (is.null(sel) || !NROW(sel) || is.null(sel$key)) return()
+    labs <- unique(as.character(sel$key))
+    sig <- paste0("BS|", paste(sort(labs), collapse = "|"))
+    if (!identical(sig, ev_sigs$bench_sel)) {
+      ev_sigs$bench_sel <- sig
+      cur <- isolate(selected_members())
+      new_sel <- sort(unique(c(cur, labs)))
+      if (!setequal(new_sel, cur)) {
+        selected_members(new_sel)
+        lesson_filter(list(type = "labels", values = new_sel))
+      }
+    }
+  })
+  observe({
+    dc <- safe_event_data('plotly_doubleclick', 'benchmark')
+    de <- safe_event_data('plotly_deselect', 'benchmark')
+    if (!is.null(dc) || !is.null(de)) {
+      lesson_filter(NULL)
+      selected_members(character(0))
+      selectRows(lesson_proxy, integer(0))
+    }
+  })
   observe({
     ev <- safe_event_data("plotly_click", "lessonBars")
     sel <- safe_event_data("plotly_selected", "lessonBars")
-    pd <- lesson_plot_data(); df <- pd$df
     if (!is.null(sel) && NROW(sel)) {
-      labs <- unique(as.character(sel$y))
-      lesson_filter(list(type = "labels", values = labs))
+      labs <- if (!is.null(sel$key)) unique(as.character(sel$key)) else unique(as.character(sel$y))
+      sig <- paste0("S|", paste(sort(labs), collapse = "|"))
+      if (!identical(sig, ev_sigs$lesson_sel)) {
+        ev_sigs$lesson_sel <- sig
+        cur <- isolate(selected_members())
+        new_sel <- sort(unique(c(cur, labs)))
+        if (!setequal(new_sel, cur)) {
+          selected_members(new_sel)
+          lesson_filter(list(type = "labels", values = new_sel))
+        }
+      }
       return()
     }
-    if (!is.null(ev) && !is.null(ev$y)) {
-      lesson_filter(list(type = "labels", values = as.character(ev$y)))
-      lab <- as.character(ev$y)[1]
-      idx <- match(lab, as.character(df$node))
-      if (is.finite(idx)) selectRows(lesson_proxy, idx)
+    if (!is.null(ev)) {
+      lab <- NULL
+      if (!is.null(ev$key)) {
+        lab <- as.character(ev$key)[1]
+      } else if (!is.null(ev$y)) {
+        lab <- as.character(ev$y)[1]
+      }
+      if (!is.null(lab) && nchar(lab)) {
+        sig <- paste0("C|", lab)
+        if (!identical(sig, ev_sigs$lesson_clk)) {
+          ev_sigs$lesson_clk <- sig
+          cur <- isolate(selected_members())
+          if (lab %in% cur) cur <- setdiff(cur, lab) else cur <- sort(unique(c(cur, lab)))
+          selected_members(cur)
+          lesson_filter(list(type = "labels", values = cur))
+        }
+      }
     }
   })
 
