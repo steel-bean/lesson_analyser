@@ -453,6 +453,7 @@ server <- function(input, output, session) {
     if (identical(dist_type, "box")) {
       top <- plotly::plot_ly(x = ~df$value, type = "box", boxpoints = "outliers", orientation = "h",
                               selectedpoints = NA, fillcolor = "#D1C8F1",
+                              marker = list(color = "#D1C8F1", line = list(color = "black", width = 0.5)),
                               line = list(color = "black", width = 0.5)) %>%
         plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
     } else {
@@ -505,23 +506,28 @@ server <- function(input, output, session) {
     req(!is.null(base), nrow(base) > 0, input$lessonMetric)
     m <- input$lessonMetric
     level <- input$aggLevel %||% "lesson"
+    grp_by <- input$groupBy %||% "none"
     base[[m]] <- suppressWarnings(as.numeric(base[[m]]))
     base <- base[is.finite(base[[m]]), , drop = FALSE]
     if (identical(level, "lesson")) {
       df_small <- base %>%
         dplyr::group_by(lesson_id) %>%
         dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
-        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
-        dplyr::transmute(node = dplyr::coalesce(lesson, lesson_id), value = as.numeric(value)) %>%
+        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson, course, module, chapter) %>% dplyr::distinct(), by = "lesson_id") %>%
+        dplyr::transmute(node = dplyr::coalesce(lesson, lesson_id),
+                         grp = if (identical(grp_by, "none")) "All" else .data[[grp_by]],
+                         value = as.numeric(value)) %>%
         dplyr::distinct(node, .keep_all = TRUE)
     } else {
       if (!(level %in% names(content_tree))) return(list(df = tibble::tibble(node = character(), value = numeric()), metric_name = m))
       df_small <- base %>%
-        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, !!rlang::sym(level)) %>% dplyr::distinct(), by = "lesson_id") %>%
+        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, course, module, chapter, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
         dplyr::group_by(node = .data[[level]]) %>%
-        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
+        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE),
+                         grp = if (identical(grp_by, "none")) "All" else first(.data[[grp_by]]),
+                         .groups = "drop") %>%
         dplyr::distinct(node, .keep_all = TRUE) %>%
-        dplyr::mutate(value = as.numeric(value))
+        dplyr::mutate(value = as.numeric(value), grp = as.character(grp))
     }
     df_small <- df_small %>% dplyr::filter(is.finite(value))
     list(df = df_small, metric_name = m)
@@ -570,19 +576,40 @@ server <- function(input, output, session) {
     req(nrow(df) > 0)
     xr <- range(c(0, df$value), na.rm = TRUE)
     dist_type <- if (!is.null(input$lessonDist) && identical(input$lessonDist, "Boxplot")) "box" else "hist"
+    groups <- if ("grp" %in% names(df)) unique(as.character(df$grp)) else "All"
+    pal_vec <- grDevices::colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(max(1, length(groups)))
+    pal <- stats::setNames(pal_vec, groups)
     if (identical(dist_type, "box")) {
-      top <- plotly::plot_ly(x = ~df$value, type = "box", boxpoints = "outliers", orientation = "h",
-                              selectedpoints = NA, fillcolor = "#D1C8F1",
-                              line = list(color = "black", width = 0.5)) %>%
-        plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
+      top <- plotly::plot_ly()
+      for (g in groups) {
+        sub <- df[df$grp %in% g | (!"grp" %in% names(df)), , drop = FALSE]
+        # Place each group's box on its own y category so the label appears on the left
+        top <- top %>% plotly::add_trace(x = sub$value, y = rep(g, nrow(sub)), type = "box", boxpoints = "outliers",
+                                         orientation = "h", name = g, fillcolor = unname(pal[g]),
+                                         marker = list(color = unname(pal[g]), line = list(color = "black", width = 0.5)),
+                                         line = list(color = "black", width = 0.5))
+      }
+      top <- top %>% plotly::layout(
+        yaxis = list(title = "", categoryorder = "array", categoryarray = groups, automargin = TRUE, showgrid = FALSE),
+        xaxis = list(range = c(0, xr[2])),
+        showlegend = TRUE
+      )
     } else {
-      top <- plotly::plot_ly(x = ~df$value, type = "histogram", nbinsx = 20, selectedpoints = NA,
-                              marker = list(color = "#D1C8F1", line = list(color = "black", width = 0.5))) %>%
-        plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
+      top <- plotly::plot_ly()
+      for (g in groups) {
+        sub <- df[df$grp %in% g | (!"grp" %in% names(df)), , drop = FALSE]
+        top <- top %>% plotly::add_trace(x = sub$value, type = "histogram", nbinsx = 20, name = g,
+                                         marker = list(color = unname(pal[g]), line = list(color = "black", width = 0.5)),
+                                         opacity = 0.6)
+      }
+      top <- top %>% plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])),
+                                    barmode = "overlay", showlegend = TRUE)
     }
     df$node <- factor(df$node, levels = unique(df$node))
+    bar_colors <- if ("grp" %in% names(df)) pal[as.character(df$grp)] else rep("#D1C8F1", nrow(df))
+    bar_colors[is.na(bar_colors)] <- "#D1C8F1"
     bars <- plotly::plot_ly(df, x = ~value, y = ~node, type = "bar", orientation = "h",
-                             marker = list(color = "#D1C8F1", line = list(color = "black", width = 0.5))) %>%
+                             marker = list(color = bar_colors, line = list(color = "black", width = 0.5))) %>%
       plotly::layout(yaxis = list(title = "", categoryorder = "array", categoryarray = levels(df$node)),
                      xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
     plt <- plotly::subplot(top, bars, nrows = 2, shareX = TRUE, heights = c(0.35, 0.65), margin = 0.02) %>%
@@ -612,26 +639,31 @@ server <- function(input, output, session) {
   # Helper to compute group df for an arbitrary metric at current aggLevel
   get_group_values <- function(m) {
     base <- section_metrics_display()
-    if (is.null(base) || nrow(base) == 0) return(tibble::tibble(node = character(), value = numeric()))
+    if (is.null(base) || nrow(base) == 0) return(tibble::tibble(node = character(), value = numeric(), grp = character()))
     lvl <- input$aggLevel %||% "lesson"
+    grp_by <- input$groupBy %||% "none"
     base[[m]] <- suppressWarnings(as.numeric(base[[m]]))
     base <- base[is.finite(base[[m]]), , drop = FALSE]
     if (identical(lvl, "lesson")) {
       out <- base %>%
         dplyr::group_by(lesson_id) %>%
         dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
-        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
-        dplyr::transmute(node = dplyr::coalesce(lesson, lesson_id), value = as.numeric(value)) %>%
+        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson, course, module, chapter) %>% dplyr::distinct(), by = "lesson_id") %>%
+        dplyr::transmute(node = dplyr::coalesce(lesson, lesson_id),
+                         value = as.numeric(value),
+                         grp = if (identical(grp_by, "none")) "All" else .data[[grp_by]]) %>%
         dplyr::distinct(node, .keep_all = TRUE)
     } else if (lvl %in% names(content_tree)) {
       out <- base %>%
-        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, !!rlang::sym(lvl)) %>% dplyr::distinct(), by = "lesson_id") %>%
+        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, course, module, chapter, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
         dplyr::group_by(node = .data[[lvl]]) %>%
-        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
+        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE),
+                         grp = if (identical(grp_by, "none")) "All" else first(.data[[grp_by]]),
+                         .groups = "drop") %>%
         dplyr::distinct(node, .keep_all = TRUE) %>%
-        dplyr::mutate(value = as.numeric(value))
+        dplyr::mutate(value = as.numeric(value), grp = as.character(grp))
     } else {
-      out <- tibble::tibble(node = character(), value = numeric())
+      out <- tibble::tibble(node = character(), value = numeric(), grp = character())
     }
     out
   }
@@ -663,6 +695,32 @@ server <- function(input, output, session) {
     peers_df    <- df %>% dplyr::filter(!(node %in% sel_labels)) %>% dplyr::mutate(y = 0)
     show_mean <- FALSE
 
+    # Determine selected group color (based on Group By and palette)
+    # Build palette for groups; sanitize NAs/empties
+    if ("grp" %in% names(df)) {
+      df$grp <- as.character(df$grp)
+      df$grp[is.na(df$grp) | df$grp == ""] <- "(NA)"
+      groups <- unique(df$grp)
+    } else {
+      groups <- "All"
+    }
+    if (length(groups) == 0) groups <- "All"
+    pal_vec <- grDevices::colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(max(1, length(groups)))
+    pal <- stats::setNames(pal_vec, groups)
+    # Sanitize group labels for palette/selection
+    if ("grp" %in% names(df)) {
+      df$grp <- as.character(df$grp)
+      df$grp[is.na(df$grp) | df$grp == ""] <- "(NA)"
+    }
+    selected_grp <- if (length(sel_labels) >= 1 && "grp" %in% names(df)) {
+      g <- df$grp[match(sel_labels[1], df$node)]
+      if (is.na(g) || length(g) == 0) "(NA)" else as.character(g)
+    } else {
+      "(NA)"
+    }
+    sc_try <- unname(pal[selected_grp])
+    sel_color <- if (length(sc_try) == 0 || is.na(sc_try)) "#D1C8F1" else sc_try
+
     p <- plotly::plot_ly()
     # Rules
     if (n < 10) {
@@ -675,7 +733,7 @@ server <- function(input, output, session) {
       }
       if (nrow(selected_df)) {
         p <- p %>% plotly::add_trace(data = selected_df, x = ~value, y = ~y, type = 'scatter', mode = 'markers',
-                                     marker = list(color = '#FFE648', size = 12, line = list(color = 'black', width = 0.6)),
+                                     marker = list(color = 'black', size = 12, line = list(color = 'black', width = 0.6)),
                                      hoverinfo = 'text',
                                      text = ~paste0(selected_df$node, ' (selected): ', signif(selected_df$value, 5)))
       }
@@ -693,7 +751,7 @@ server <- function(input, output, session) {
       shapes <- list()
       if (all(is.finite(q))) {
         shapes <- c(shapes, list(
-          list(type = 'rect', x0 = q[1], x1 = q[3], y0 = -0.15, y1 = 0.15, line = list(color = 'black', width = 1), fillcolor = '#EEEEEE', opacity = 0.5),
+          list(type = 'rect', x0 = q[1], x1 = q[3], y0 = -0.15, y1 = 0.15, line = list(color = 'black', width = 1), fillcolor = sel_color, opacity = 0.5),
           list(type = 'line', x0 = q[2], x1 = q[2], y0 = -0.2, y1 = 0.2, line = list(color = 'black', width = 1.5))
         ))
       }
@@ -706,7 +764,7 @@ server <- function(input, output, session) {
       }
       if (nrow(selected_df)) {
         p <- p %>% plotly::add_trace(data = selected_df, x = ~value, y = ~y, type = 'scatter', mode = 'markers',
-                                     marker = list(color = '#FFE648', size = 12, line = list(color = 'black', width = 0.6)),
+                                     marker = list(color = 'black', size = 12, line = list(color = 'black', width = 0.6)),
                                      hoverinfo = 'text',
                                      text = ~paste0(selected_df$node, ' (selected): ', signif(selected_df$value, 5)))
       }
@@ -714,10 +772,13 @@ server <- function(input, output, session) {
     } else {
       # n >= 20 : box + whiskers with outliers
       p <- p %>% plotly::add_trace(x = ~vals, y = ~rep(0, length(vals)), type = 'box', orientation = 'h',
-                                   boxpoints = 'outliers', hoverinfo = 'skip', showlegend = FALSE)
+                                   boxpoints = 'outliers', hoverinfo = 'skip', showlegend = FALSE,
+                                   fillcolor = sel_color,
+                                   marker = list(color = sel_color, line = list(color = "black", width = 0.6)),
+                                   line = list(color = "black", width = 1))
       if (nrow(selected_df)) {
         p <- p %>% plotly::add_trace(data = selected_df, x = ~value, y = ~y, type = 'scatter', mode = 'markers',
-                                     marker = list(color = '#FFE648', size = 12, line = list(color = 'black', width = 0.6)),
+                                     marker = list(color = 'black', size = 12, line = list(color = 'black', width = 0.6)),
                                      hoverinfo = 'text',
                                      text = ~paste0(selected_df$node, ' (selected): ', signif(selected_df$value, 5)))
       }
@@ -771,6 +832,7 @@ server <- function(input, output, session) {
     # Build wide data of selected metrics for current level
     dfs <- lapply(mets, function(m) {
       d <- get_group_values(m)
+      d <- dplyr::select(d, node, value) %>% dplyr::distinct(node, .keep_all = TRUE)
       names(d) <- c("node", m)
       d
     })
@@ -810,7 +872,7 @@ server <- function(input, output, session) {
           }
           if (nrow(sels)) {
             p <- p %>% plotly::add_trace(data = sels, x = sels[[xmet]], y = sels[[ymet]], type = 'scatter', mode = 'markers',
-                                         marker = list(color = '#FFE648', size = 9, line = list(color = 'black', width = 0.6)),
+                                         marker = list(color = 'black', size = 9, line = list(color = 'black', width = 0.6)),
                                          hoverinfo = 'text',
                                          text = ~paste0(sels$node, ' (selected)<br>', xmet, ': ', signif(sels[[xmet]], 5), '<br>', ymet, ': ', signif(sels[[ymet]], 5)))
           }
@@ -1093,7 +1155,8 @@ server <- function(input, output, session) {
     df <- section_metrics_refactored()
     if (is.null(df) || nrow(df) == 0) return(tibble::tibble())
     # Ensure heading-by-level columns exist for new metric support even with older cached rows
-    ensure_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6","nodes_native","nodes_custom")
+    ensure_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6","nodes_native","nodes_custom",
+                     "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total")
     missing <- setdiff(ensure_cols, names(df))
     if (length(missing)) {
       for (nm in missing) df[[nm]] <- 0L
@@ -1116,6 +1179,10 @@ server <- function(input, output, session) {
         headings_h6 = sum(headings_h6, na.rm = TRUE),
         nodes_native = sum(nodes_native, na.rm = TRUE),
         nodes_custom = sum(nodes_custom, na.rm = TRUE),
+        cc_stacks_total = sum(cc_stacks_total, na.rm = TRUE),
+        cc_stacks_single = sum(cc_stacks_single, na.rm = TRUE),
+        cc_stacks_multi = sum(cc_stacks_multi, na.rm = TRUE),
+        cc_questions_total = sum(cc_questions_total, na.rm = TRUE),
         images_count = sum(images_count, na.rm = TRUE),
         tables_count = sum(tables_count, na.rm = TRUE),
         lists_count = sum(lists_count, na.rm = TRUE),
@@ -1164,7 +1231,8 @@ server <- function(input, output, session) {
     "words_total","words_nomath","chars_total","sentences_nomath",
     "blocks_total","words_sum","headings_count","headings_h1","headings_h2","headings_h3","headings_h6","images_count",
     "tables_count","lists_count","latex_total","latex_inline",
-    "latex_display","latex_display_multi","nodes_native","nodes_custom"
+    "latex_display","latex_display_multi","nodes_native","nodes_custom",
+    "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total"
   )
 
   observe({
@@ -1187,13 +1255,26 @@ server <- function(input, output, session) {
     updateSelectInput(session, "aggLevel", choices = choices, selected = default)
   })
 
+  # Populate Group By choices: higher levels above current aggLevel
+  observe({
+    level_order <- c("course","module","chapter","lesson")
+    present <- intersect(level_order, names(content_tree))
+    lvl <- input$aggLevel %||% "lesson"
+    if (!(lvl %in% present)) lvl <- tail(present, 1)
+    idx <- match(lvl, level_order)
+    higher <- if (!is.na(idx) && idx > 1) level_order[seq_len(idx - 1)] else character(0)
+    higher <- intersect(higher, present)
+    choices <- c("None" = "none", setNames(higher, stringr::str_to_title(higher)))
+    updateSelectInput(session, "groupBy", choices = choices, selected = "none")
+  })
   # Aggregated metrics by selected level
   agg_metrics <- reactive({
     level <- input$aggLevel %||% "lesson"
     les <- lesson_metrics()
     if (is.null(les) || nrow(les) == 0) return(tibble::tibble())
     # Ensure heading-by-level cols exist
-    ensure_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6","nodes_native","nodes_custom")
+    ensure_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6","nodes_native","nodes_custom",
+                     "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total")
     for (nm in setdiff(ensure_cols, names(les))) les[[nm]] <- 0L
     if (identical(level, "lesson")) {
       # Use lesson title for labels instead of lesson_id; fall back to id if title absent
@@ -1227,6 +1308,10 @@ server <- function(input, output, session) {
         headings_h6 = sum(headings_h6, na.rm = TRUE),
         nodes_native = sum(nodes_native, na.rm = TRUE),
         nodes_custom = sum(nodes_custom, na.rm = TRUE),
+        cc_stacks_total = sum(cc_stacks_total, na.rm = TRUE),
+        cc_stacks_single = sum(cc_stacks_single, na.rm = TRUE),
+        cc_stacks_multi = sum(cc_stacks_multi, na.rm = TRUE),
+        cc_questions_total = sum(cc_questions_total, na.rm = TRUE),
         images_count = sum(images_count, na.rm = TRUE),
         tables_count = sum(tables_count, na.rm = TRUE),
         lists_count = sum(lists_count, na.rm = TRUE),

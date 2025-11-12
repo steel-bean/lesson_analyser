@@ -35,6 +35,7 @@ library(patchwork)
 library(ggExtra)
 library(cowplot)
 library(plotly)
+library(RColorBrewer)
 library(ggiraph)
 
 # Optional side-panel geoms for distributions

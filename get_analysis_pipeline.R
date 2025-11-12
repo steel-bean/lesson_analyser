@@ -220,6 +220,43 @@ count_nodes_native_custom <- function(node) {
   tibble::tibble(nodes_native = counts$native, nodes_custom = counts$custom)
 }
 
+# Count concept-check stacks and questions (recursive)
+count_concept_checks <- function(node) {
+  totals <- list(stacks = 0L, single = 0L, multi = 0L, questions = 0L)
+  walk <- function(n) {
+    if (is.null(n)) return()
+    if (is.list(n) && !is.null(n$type) && identical(n$type, "concept-check-stack")) {
+      totals$stacks <<- totals$stacks + 1L
+      qids <- tryCatch(n$attrs$questionIds, error = function(e) NULL)
+      qlen <- 0L
+      if (!is.null(qids)) {
+        # questionIds can be a vector or list; coerce length robustly
+        qlen <- tryCatch(length(qids), error = function(e) 0L)
+        if (!is.finite(qlen)) qlen <- 0L
+      }
+      totals$questions <<- totals$questions + as.integer(qlen)
+      if (qlen <= 1L) {
+        totals$single <<- totals$single + 1L
+      } else {
+        totals$multi <<- totals$multi + 1L
+      }
+    }
+    # Recurse typical children
+    if (is.list(n$content)) purrr::walk(n$content, walk)
+    # Also iterate through nested lists (marks/attrs variations)
+    if (is.list(n) && is.null(n$type)) {
+      for (el in n) if (is.list(el)) walk(el)
+    }
+  }
+  walk(node)
+  tibble::tibble(
+    cc_stacks_total = totals$stacks,
+    cc_stacks_single = totals$single,
+    cc_stacks_multi = totals$multi,
+    cc_questions_total = totals$questions
+  )
+}
+
 # String cleanups used for text metrics (strip math) and sentence counting
 strip_math <- function(x) {
   x %>%
@@ -627,7 +664,12 @@ aggregate_blocks_by_section <- function(sections_index) {
       inline_to_display_ratio = dplyr::if_else(latex_display > 0, latex_inline / latex_display, as.numeric(NA)),
       # Node counts across entire subdoc
       nodes_native = count_nodes_native_custom(subdoc)$nodes_native,
-      nodes_custom = count_nodes_native_custom(subdoc)$nodes_custom
+      nodes_custom = count_nodes_native_custom(subdoc)$nodes_custom,
+      # Concept-check counts across entire subdoc
+      cc_stacks_total = count_concept_checks(subdoc)$cc_stacks_total,
+      cc_stacks_single = count_concept_checks(subdoc)$cc_stacks_single,
+      cc_stacks_multi = count_concept_checks(subdoc)$cc_stacks_multi,
+      cc_questions_total = count_concept_checks(subdoc)$cc_questions_total
     ) %>%
     dplyr::ungroup() %>%
     dplyr::select(
@@ -635,6 +677,7 @@ aggregate_blocks_by_section <- function(sections_index) {
       blocks_total, words_sum, words_mean, words_median, words_max,
       headings_count, headings_h1, headings_h2, headings_h3, headings_h6,
       images_count, tables_count, lists_count, nodes_native, nodes_custom,
+      cc_stacks_total, cc_stacks_single, cc_stacks_multi, cc_questions_total,
       latex_total, latex_inline, latex_display, latex_display_multi, inline_to_display_ratio
     )
 }
@@ -659,6 +702,7 @@ build_section_metrics_table <- function(pulled_content_df) {
       blocks_total, words_sum, words_mean, words_median, words_max,
       headings_count, headings_h1, headings_h2, headings_h3, headings_h6,
       images_count, tables_count, lists_count, nodes_native, nodes_custom,
+      cc_stacks_total, cc_stacks_single, cc_stacks_multi, cc_questions_total,
       latex_total, latex_inline, latex_display, latex_display_multi, inline_to_display_ratio,
       start_block, end_block#,
       # subdoc_json  # Keep commented: large strings; enable if needed for debugging

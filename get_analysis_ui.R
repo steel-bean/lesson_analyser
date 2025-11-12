@@ -43,6 +43,7 @@ ui <- fluidPage(
               div(style = "display:flex; gap:16px; align-items:center;",
                 selectInput("lessonMetric", "Metric", choices = NULL, width = "300px"),
                 selectInput("aggLevel", "Aggregate by", choices = NULL, width = "260px"),
+                selectInput("groupBy", "Group By", choices = NULL, width = "200px"),
                 selectInput("lessonDist", "Distribution", choices = c("Boxplot","Histogram"), selected = "Boxplot", width = "200px")
               ),
               plotly::plotlyOutput("lessonPlotly", height = "560px")
