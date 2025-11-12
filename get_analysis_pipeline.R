@@ -195,6 +195,31 @@ analyze_section_blocks <- function(lesson_id, section_index, subdoc) {
   })
 }
 
+# Count native vs custom tiptap nodes within a subdoc (recursive)
+count_nodes_native_custom <- function(node) {
+  native_types <- c(
+    "doc","paragraph","text","heading",
+    "bulletList","orderedList","listItem",
+    "blockquote","codeBlock","hardBreak","horizontalRule",
+    "image","table","tableRow","tableCell"
+  )
+  counts <- list(native = 0L, custom = 0L)
+  walk <- function(n) {
+    if (is.null(n)) return()
+    if (is.list(n) && !is.null(n$type)) {
+      if (n$type %in% native_types) counts$native <<- counts$native + 1L else counts$custom <<- counts$custom + 1L
+    }
+    # Recurse typical children
+    if (is.list(n$content)) purrr::walk(n$content, walk)
+    # Also iterate over list elements
+    if (is.list(n) && is.null(n$type)) {
+      for (el in n) if (is.list(el)) walk(el)
+    }
+  }
+  walk(node)
+  tibble::tibble(nodes_native = counts$native, nodes_custom = counts$custom)
+}
+
 # String cleanups used for text metrics (strip math) and sentence counting
 strip_math <- function(x) {
   x %>%
@@ -599,14 +624,17 @@ aggregate_blocks_by_section <- function(sections_index) {
       latex_inline        = if (nrow(block_rows)) sum(block_rows$latex_inline, na.rm = TRUE) else 0,
       latex_display       = if (nrow(block_rows)) sum(block_rows$latex_display, na.rm = TRUE) else 0,
       latex_display_multi = if (nrow(block_rows)) sum(block_rows$latex_display_multiline, na.rm = TRUE) else 0,
-      inline_to_display_ratio = dplyr::if_else(latex_display > 0, latex_inline / latex_display, as.numeric(NA))
+      inline_to_display_ratio = dplyr::if_else(latex_display > 0, latex_inline / latex_display, as.numeric(NA)),
+      # Node counts across entire subdoc
+      nodes_native = count_nodes_native_custom(subdoc)$nodes_native,
+      nodes_custom = count_nodes_native_custom(subdoc)$nodes_custom
     ) %>%
     dplyr::ungroup() %>%
     dplyr::select(
       lesson_id, section_index,
       blocks_total, words_sum, words_mean, words_median, words_max,
       headings_count, headings_h1, headings_h2, headings_h3, headings_h6,
-      images_count, tables_count, lists_count,
+      images_count, tables_count, lists_count, nodes_native, nodes_custom,
       latex_total, latex_inline, latex_display, latex_display_multi, inline_to_display_ratio
     )
 }
@@ -630,7 +658,7 @@ build_section_metrics_table <- function(pulled_content_df) {
       section_title_norm,
       blocks_total, words_sum, words_mean, words_median, words_max,
       headings_count, headings_h1, headings_h2, headings_h3, headings_h6,
-      images_count, tables_count, lists_count,
+      images_count, tables_count, lists_count, nodes_native, nodes_custom,
       latex_total, latex_inline, latex_display, latex_display_multi, inline_to_display_ratio,
       start_block, end_block#,
       # subdoc_json  # Keep commented: large strings; enable if needed for debugging

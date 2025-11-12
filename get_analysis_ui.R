@@ -37,7 +37,7 @@ ui <- fluidPage(
             DTOutput("sectionMetricsTable")
           )
         ),
-        tabPanel("Lesson Analysis",
+        tabPanel("Group analysis",
           div(
             div(style = "max-width: 960px; margin: 0 auto;",
               div(style = "display:flex; gap:16px; align-items:center;",
@@ -49,6 +49,28 @@ ui <- fluidPage(
             ),
             
             DTOutput("lessonMetricsTable")
+          )
+        ),
+        tabPanel("Benchmark analysis",
+          div(
+            div(style = "max-width: 960px; margin: 0 auto;",
+              div(style = "display:flex; gap:16px; align-items:center; margin-bottom:12px;",
+                shinyWidgets::pickerInput("benchmarkMetrics", "Metrics", choices = NULL, multiple = TRUE,
+                  options = list(`actions-box` = TRUE, `selected-text-format` = "count > 1"), width = "320px")
+              ),
+              uiOutput("benchmarkContainer")
+            )
+          )
+        ),
+        tabPanel("Metric analysis",
+          div(
+            div(style = "max-width: 960px; margin: 0 auto;",
+              div(style = "display:flex; gap:16px; align-items:center; margin-bottom:12px;",
+                shinyWidgets::pickerInput("metricMatrixMetrics", "Metrics", choices = NULL, multiple = TRUE,
+                  options = list(`actions-box` = TRUE, `selected-text-format` = "count > 1"), width = "420px")
+              ),
+              plotly::plotlyOutput("metricMatrixPlot", height = "560px")
+            )
           )
         )
       )
