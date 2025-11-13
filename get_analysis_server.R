@@ -515,6 +515,10 @@ server <- function(input, output, session) {
     base <- section_metrics_display()
     req(!is.null(base), nrow(base) > 0, input$lessonMetric)
     m <- input$lessonMetric
+    # If the requested metric column is missing, return empty safely
+    if (!(m %in% names(base))) {
+      return(list(df = tibble::tibble(node_id = character(), node = character(), value = numeric(), grp = character()), metric_name = m))
+    }
     level <- input$aggLevel %||% "lesson"
     grp_by <- input$groupBy %||% "none"
     base[[m]] <- suppressWarnings(as.numeric(base[[m]]))
@@ -524,7 +528,8 @@ server <- function(input, output, session) {
         dplyr::group_by(lesson_id) %>%
         dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
         dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson, course, module, chapter) %>% dplyr::distinct(), by = "lesson_id") %>%
-        dplyr::transmute(node = dplyr::coalesce(lesson, lesson_id),
+        dplyr::transmute(node_id = lesson_id,
+                         node = dplyr::coalesce(lesson, lesson_id),
                          grp = if (identical(grp_by, "none")) "All" else .data[[grp_by]],
                          value = as.numeric(value)) %>%
         dplyr::distinct(node, .keep_all = TRUE)
@@ -537,7 +542,9 @@ server <- function(input, output, session) {
                          grp = if (identical(grp_by, "none")) "All" else first(.data[[grp_by]]),
                          .groups = "drop") %>%
         dplyr::distinct(node, .keep_all = TRUE) %>%
-        dplyr::mutate(value = as.numeric(value), grp = as.character(grp))
+        dplyr::mutate(node_id = as.character(node),
+                      value = as.numeric(value), grp = as.character(grp)) %>%
+        dplyr::relocate(node_id, .before = node)
     }
     df_small <- df_small %>% dplyr::filter(is.finite(value))
     list(df = df_small, metric_name = m)
@@ -631,7 +638,18 @@ server <- function(input, output, session) {
       top <- top %>% plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])),
                                     barmode = "overlay", showlegend = TRUE)
     }
-    df$node <- factor(df$node, levels = unique(df$node))
+    # Order bars by node order in the tree for the selected aggregation level
+    lvl_for_order <- input$aggLevel %||% "lesson"
+    tree_order <- if (lvl_for_order %in% names(content_tree)) {
+      unique(content_tree[[lvl_for_order]])
+    } else {
+      unique(as.character(df$node))
+    }
+    # Keep only nodes present in df, in tree order
+    level_nodes <- tree_order[tree_order %in% as.character(df$node)]
+    # Fallback to current order if empty for any reason
+    if (!length(level_nodes)) level_nodes <- unique(as.character(df$node))
+    df$node <- factor(df$node, levels = level_nodes)
     bar_colors <- if ("grp" %in% names(df)) pal[as.character(df$grp)] else rep("#D1C8F1", nrow(df))
     bar_colors[is.na(bar_colors)] <- "#D1C8F1"
     # Highlight selected bars in black (supports multi-select)
@@ -663,11 +681,13 @@ server <- function(input, output, session) {
 
   # Populate benchmark metrics choices
   observe({
-    df <- agg_metrics()
-    if (is.null(df) || nrow(df) == 0) return()
-    ok <- intersect(numeric_metric_names, names(df))
-    if (length(ok) == 0) return()
-    updatePickerInput(session, "benchmarkMetrics", choices = ok, selected = ok[1])
+    df <- tryCatch(agg_metrics(), error = function(e) NULL)
+    # Default to full list if data not yet available
+    ok <- if (!is.null(df) && nrow(df) > 0) intersect(numeric_metric_names, names(df)) else numeric_metric_names
+    if (length(ok) == 0) ok <- numeric_metric_names
+    current <- isolate(input$benchmarkMetrics)
+    sel <- if (!is.null(current) && length(current) >= 1) intersect(current, ok) else head(ok, 1)
+    shinyWidgets::updatePickerInput(session, "benchmarkMetrics", choices = ok, selected = sel)
   })
 
   # Helper to compute group df for an arbitrary metric at current aggLevel
@@ -866,13 +886,14 @@ server <- function(input, output, session) {
 
   # ---- Metric analysis: scatterplot matrix for selected metrics ----
   observe({
-    df <- agg_metrics()
-    if (is.null(df) || nrow(df) == 0) return()
-    ok <- intersect(numeric_metric_names, names(df))
-    if (length(ok) == 0) return()
+    df <- tryCatch(agg_metrics(), error = function(e) NULL)
+    ok <- if (!is.null(df) && nrow(df) > 0) intersect(numeric_metric_names, names(df)) else numeric_metric_names
+    if (length(ok) == 0) ok <- numeric_metric_names
     # Preselect up to 4 metrics if none selected
+    current <- isolate(input$metricMatrixMetrics)
     default_sel <- head(ok, 4)
-    updatePickerInput(session, "metricMatrixMetrics", choices = ok, selected = input$metricMatrixMetrics %||% default_sel)
+    sel <- if (!is.null(current) && length(current)) intersect(current, ok) else default_sel
+    shinyWidgets::updatePickerInput(session, "metricMatrixMetrics", choices = ok, selected = sel)
   })
 
   output$metricMatrixPlot <- plotly::renderPlotly({
@@ -1326,7 +1347,10 @@ server <- function(input, output, session) {
   # Aggregated per-lesson metrics (sums only; exclude non-countable metrics)
   lesson_metrics <- reactive({
     acc <- lesson_metrics_acc()
-    if (!is.null(acc) && nrow(acc) > 0) return(acc)
+    # Only trust accumulator if it already contains the latest metric columns (incl. concept-checks)
+    required_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6","nodes_native","nodes_custom",
+                       "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total")
+    if (!is.null(acc) && nrow(acc) > 0 && all(required_cols %in% names(acc))) return(acc)
     df <- section_metrics_refactored()
     if (is.null(df) || nrow(df) == 0) return(tibble::tibble())
     # Ensure heading-by-level columns exist for new metric support even with older cached rows
@@ -1377,24 +1401,48 @@ server <- function(input, output, session) {
   })
 
   output$lessonMetricsTable <- renderDT({
-    df <- agg_metrics()
-    if (is.null(df) || nrow(df) == 0) {
-      return(datatable(data.frame()))
+    pd <- tryCatch(lesson_plot_data(), error = function(e) NULL)
+    if (is.null(pd) || is.null(pd$df) || !is.data.frame(pd$df)) {
+      return(DT::datatable(data.frame()))
     }
-    filt <- lesson_filter()
-    if (!is.null(filt)) {
-      m <- isolate(input$lessonMetric)
-      if (!is.null(m) && m %in% names(df)) {
-        if (identical(filt$type, "labels")) {
-          df <- df %>% dplyr::filter(node %in% filt$values)
-        } else if (identical(filt$type, "range") && length(filt$values) == 2) {
-          rng <- sort(as.numeric(filt$values))
-          df <- df %>% dplyr::filter(is.finite(.data[[m]]) & .data[[m]] >= rng[1] & .data[[m]] <= rng[2])
-        }
+    df <- pd$df
+    # Keep a copy in case filtering throws
+    df0 <- df
+    # Filtering logic (default: show all rows; filter only when non-empty selection)
+    res <- tryCatch({
+      filt <- lesson_filter()
+      sm <- selected_members()
+      sel_labels <- if (is.null(sm)) character(0) else as.character(sm)
+      if (!is.null(filt) && identical(filt$type, "labels")) {
+        vals <- filt$values
+        vals <- if (is.null(vals)) character(0) else as.character(vals)
+        if (length(vals)) sel_labels <- unique(c(sel_labels, vals))
       }
-    }
-    datatable(
-      df,
+      if (length(sel_labels) > 0) {
+        df %>% dplyr::mutate(node = as.character(.data$node)) %>% dplyr::filter(.data$node %in% sel_labels)
+      } else if (!is.null(filt) && identical(filt$type, "range") && length(filt$values) == 2) {
+        m <- isolate(input$lessonMetric)
+        if (!is.null(m) && m %in% names(df0)) {
+          rng <- sort(as.numeric(filt$values))
+          df %>% dplyr::filter(is.finite(.data[[m]]) & .data[[m]] >= rng[1] & .data[[m]] <= rng[2])
+        } else {
+          df
+        }
+      } else {
+        df
+      }
+    }, error = function(e) df0)
+    # Build display table to match the bar chart data
+    tbl <- res %>%
+      dplyr::transmute(
+        id = .data$node_id %||% as.character(.data$node),
+        node = as.character(.data$node),
+        group = .data$grp %||% "All",
+        metric = isolate(input$lessonMetric) %||% pd$metric_name,
+        value = .data$value
+      )
+    DT::datatable(
+      tbl,
       rownames = FALSE,
       options = list(pageLength = 10, scrollX = TRUE),
       selection = 'single'
@@ -1411,11 +1459,13 @@ server <- function(input, output, session) {
   )
 
   observe({
-    df <- agg_metrics()
-    if (is.null(df) || nrow(df) == 0) return()
-    ok <- intersect(numeric_metric_names, names(df))
-    if (length(ok) == 0) return()
-    updateSelectInput(session, "lessonMetric", choices = ok, selected = ok[[1]])
+    # Populate metric choices robustly; don't depend on data being present
+    df <- tryCatch(agg_metrics(), error = function(e) NULL)
+    ok <- if (!is.null(df)) intersect(numeric_metric_names, names(df)) else numeric_metric_names
+    if (length(ok) == 0) ok <- numeric_metric_names
+    current <- isolate(input$lessonMetric)
+    sel <- if (!is.null(current) && current %in% ok) current else ok[[1]]
+    updateSelectInput(session, "lessonMetric", choices = ok, selected = sel)
   })
 
   # Populate aggregate level choices from content_tree (Level 0-3)
