@@ -461,6 +461,8 @@ server <- function(input, output, session) {
     if (identical(dist_type, "box")) {
       top <- plotly::plot_ly(x = ~df$value, type = "box", boxpoints = "outliers", orientation = "h",
                               selectedpoints = NA, fillcolor = "#D1C8F1",
+                              hovertemplate = "%{x}<extra></extra>",
+                              hoverinfo = "x",
                               marker = list(color = "#D1C8F1", line = list(color = "black", width = 0.5)),
                               line = list(color = "black", width = 0.5)) %>%
         plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
@@ -474,7 +476,8 @@ server <- function(input, output, session) {
     # Match group analysis border behavior: remove borders if many bars
     line_w_sec <- if (nrow(df) > 15) 0 else 0.5
     bars <- plotly::plot_ly(df, x = ~value, y = ~sec_label, type = "bar", orientation = "h",
-                             marker = list(color = "#D1C8F1", line = list(color = "black", width = line_w_sec))) %>%
+                             marker = list(color = "#D1C8F1", line = list(color = "black", width = line_w_sec)),
+                             hovertemplate = "%{y}: %{x}<extra></extra>") %>%
       plotly::layout(yaxis = list(title = "", categoryorder = "array", categoryarray = levels(df$sec_label)),
                      xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
     plt <- plotly::subplot(top, bars, nrows = 2, shareX = TRUE, heights = c(0.35, 0.65), margin = 0.02) %>%
@@ -660,7 +663,8 @@ server <- function(input, output, session) {
     }
     line_w <- if (nrow(df) > 15) 0 else 0.5
     bars <- plotly::plot_ly(df, x = ~value, y = ~node, key = ~as.character(node), type = "bar", orientation = "h",
-                             marker = list(color = bar_colors, line = list(color = "black", width = line_w))) %>%
+                             marker = list(color = bar_colors, line = list(color = "black", width = line_w)),
+                             hovertemplate = "%{y}: %{x}<extra></extra>") %>%
       plotly::layout(yaxis = list(title = "", categoryorder = "array", categoryarray = levels(df$node)),
                      xaxis = list(range = c(0, xr[2])), showlegend = FALSE)
     plt <- plotly::subplot(top, bars, nrows = 2, shareX = TRUE, heights = c(0.35, 0.65), margin = 0.02) %>%
@@ -878,7 +882,16 @@ server <- function(input, output, session) {
             plotly::event_register('plotly_doubleclick') %>%
             plotly::event_register('plotly_deselect')
           p$x$source <- 'benchmark'
-          p
+          p %>%
+            plotly::layout(dragmode = "select") %>%
+            plotly::config(
+              displaylogo = FALSE,
+              scrollZoom = FALSE,
+              modeBarButtonsToRemove = c(
+                'zoom2d','pan2d','lasso2d','zoomIn2d','zoomOut2d',
+                'hoverClosestCartesian','hoverCompareCartesian','toggleSpikelines'
+              )
+            )
         })
       })
     }
@@ -898,6 +911,10 @@ server <- function(input, output, session) {
 
   output$metricMatrixPlot <- plotly::renderPlotly({
     mets <- input$metricMatrixMetrics
+    # Prevent duplicate metrics which create same x/y and duplicate tooltip lines
+    if (!is.null(mets) && length(mets)) {
+      mets <- unique(mets)
+    }
     req(!is.null(mets), length(mets) >= 2)
     # Build wide data of selected metrics for current level
     dfs <- lapply(mets, function(m) {
@@ -940,18 +957,28 @@ server <- function(input, output, session) {
           sels  <- wide %>% dplyr::filter(is.finite(.data[[xmet]]) & is.finite(.data[[ymet]]) & .selected)
           p <- plotly::plot_ly()
           if (nrow(peers)) {
-            p <- p %>% plotly::add_trace(data = peers, x = peers[[xmet]], y = peers[[ymet]], type = 'scatter', mode = 'markers',
-                                         marker = list(color = '#D1C8F1', size = 7, line = list(color = 'black', width = 0.2)),
-                                         key = peers$node,
-                                         hoverinfo = 'text',
-                                         text = ~paste0(peers$node, '<br>', xmet, ': ', signif(peers[[xmet]], 5), '<br>', ymet, ': ', signif(peers[[ymet]], 5)))
+            hovertemplate_str <- paste0("%{text}<br>", xmet, ": %{x}<br>", ymet, ": %{y}<extra></extra>")
+            p <- p %>% plotly::add_trace(
+              data = peers,
+              x = peers[[xmet]], y = peers[[ymet]],
+              type = 'scatter', mode = 'markers',
+              marker = list(color = '#D1C8F1', size = 7, line = list(color = 'black', width = 0.2)),
+              key = peers$node,
+              text = peers$node,
+              hovertemplate = hovertemplate_str
+            )
           }
           if (nrow(sels)) {
-            p <- p %>% plotly::add_trace(data = sels, x = sels[[xmet]], y = sels[[ymet]], type = 'scatter', mode = 'markers',
-                                         marker = list(color = 'black', size = 9, line = list(color = 'black', width = 0.6)),
-                                         key = sels$node,
-                                         hoverinfo = 'text',
-                                         text = ~paste0(sels$node, ' (selected)<br>', xmet, ': ', signif(sels[[xmet]], 5), '<br>', ymet, ': ', signif(sels[[ymet]], 5)))
+            hovertemplate_str_sel <- paste0("%{text}<br>", xmet, ": %{x}<br>", ymet, ": %{y}<extra></extra>")
+            p <- p %>% plotly::add_trace(
+              data = sels,
+              x = sels[[xmet]], y = sels[[ymet]],
+              type = 'scatter', mode = 'markers',
+              marker = list(color = 'black', size = 9, line = list(color = 'black', width = 0.6)),
+              key = sels$node,
+              text = paste0(sels$node, " (selected)"),
+              hovertemplate = hovertemplate_str_sel
+            )
           }
           p <- p %>% plotly::layout(xaxis = list(title = if (i == k) xmet else "", showgrid = FALSE),
                                     yaxis = list(title = if (j == 1) ymet else "", showgrid = FALSE))
@@ -968,6 +995,17 @@ server <- function(input, output, session) {
       plotly::event_register('plotly_deselect')
     subplot$x$source <- 'metricMatrix'
     subplot$sizingPolicy$defaultHeight <- h
+    # Match interaction/config with other graphs: selection-enabled, minimal toolbar
+    subplot <- subplot %>%
+      plotly::layout(dragmode = "select") %>%
+      plotly::config(
+        displaylogo = FALSE,
+        scrollZoom = FALSE,
+        modeBarButtonsToRemove = c(
+          'zoom2d','pan2d','lasso2d','zoomIn2d','zoomOut2d',
+          'hoverClosestCartesian','hoverCompareCartesian','toggleSpikelines'
+        )
+      )
     subplot
   })
 

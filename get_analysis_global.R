@@ -183,8 +183,9 @@ get_content_df <- function(filtered_content_index) {
   query <- paste0("
     SELECT
       CAST(l.id AS CHAR) AS lesson_id,
-      l.content           AS content_json
+      d.content           AS content_json
     FROM lessons l
+    JOIN docs d ON l.doc_id = d.id
     WHERE l.id IN (", ids_sql, ");
   ")
   
