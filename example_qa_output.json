@@ -1,0 +1,67 @@
+{
+    "lesson_typing": {
+        "stated_type": {
+            "stage": "conceptual",
+            "sub_type": "foundational_concept"
+        },
+        "inferred_type": {
+            "stage": "conceptual",
+            "sub_type": "comparative_concept"
+        },
+        "typing_justification": "The lesson repeatedly contrasts series and parallel circuits and focuses on clarifying the difference between them, which aligns more closely with a Comparative Concept lesson than a pure Foundational Concept introduction."
+    },
+    "atomic_lesson_assessment": {
+        "is_single_atomic_lesson": false,
+        "arcs": [
+            {
+                "id": "arc_a",
+                "label": "Arc A – Foundational concept",
+                "description": "Introduces the basic idea of an electric circuit and current flow, with a first simple model of components connected in a loop."
+            },
+            {
+                "id": "arc_b",
+                "label": "Arc B – Comparative concept",
+                "description": "Compares series and parallel circuits, highlighting differences in voltage, current distribution and what happens when one component fails."
+            }
+        ]
+    },
+    "rubric": {
+        "template_fit": {
+            "score": 2,
+            "reason": "The lesson mixes a Foundational Concept arc (what a circuit is) with a Comparative Concept arc (series vs parallel), so the cognitive intent is split between introducing a new idea and differentiating related ideas."
+        },
+        "template_structure_compliance": {
+            "score": 2,
+            "reason": "There is a recognisable overview and some concept development, but relationships and application are interleaved, and a short guided problem set appears where a Conceptual Relationships block should be."
+        },
+        "cognitive_integrity": {
+            "score": 2,
+            "reason": "Two distinct conceptual arcs are developed to similar depth: one builds a first model of a simple circuit, and another contrasts series and parallel circuits with their own examples and explanations."
+        },
+        "template_boundary_discipline": {
+            "score": 2,
+            "reason": "Alongside conceptual explanation, the lesson includes several step-by-step worked examples calculating current and voltage, plus a small practice set, which encroaches on Skills and Task territory."
+        },
+        "progressive_model_principle": {
+            "score": 1,
+            "reason": "The core model of a simple circuit is mostly clear, but it is quickly followed by multiple variations and edge cases (different configurations, short circuits), which slightly dilute the first, clean model."
+        },
+        "lesson_economy_and_cognitive_load": {
+            "score": 2,
+            "reason": "The lesson attempts to introduce basic circuits, compare series vs parallel, and run through six quantitative examples in a single sitting, which is beyond a single natural unit of conceptual integrity."
+        }
+    },
+    "priority_index": {
+        "template_fit": 2,
+        "cognitive_integrity": 2,
+        "template_boundary_discipline": 2,
+        "base_sum": 6,
+        "overload_factor": 1.6,
+        "priority_index": 9.6,
+        "priority_band": "Medium",
+        "priority_explanation": "The mixed intent, dual conceptual arcs, and skills drift warrant a moderate restructuring priority; the overload factor is elevated due to the number of concepts and examples packed into one lesson."
+    }
+}
+
+
+

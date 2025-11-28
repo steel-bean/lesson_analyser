@@ -17,8 +17,62 @@ server <- function(input, output, session) {
   .state$sec_acc <- tibble::tibble()
   .state$les_acc <- tibble::tibble()
   .state$analysis_cache <- analysis_cache
+  .state$qualitative_enabled <- FALSE
+  .state$qual_results <- tibble::tibble(lesson_id = character(), qualitative_json = character())
   # Reactive progress for UI display
   progress_info <- reactiveVal(list(done = 0L, total = 0L))
+
+  # Helper: extract rubric scores (supports both rubric_scores and rubric.*$score shapes)
+  extract_qa_scores <- function(qjson) {
+    cols <- list(
+      qa_template_fit = NA_real_,
+      qa_template_structure_compliance = NA_real_,
+      qa_cognitive_integrity = NA_real_,
+      qa_template_boundary_discipline = NA_real_,
+      qa_progressive_model_principle = NA_real_,
+      qa_lesson_economy_and_cognitive_load = NA_real_,
+      qa_priority_index = NA_real_,
+      qa_model = NA_character_
+    )
+    if (is.null(qjson) || is.na(qjson) || identical(qjson, "")) return(as.data.frame(cols))
+    x <- tryCatch(jsonlite::fromJSON(qjson, simplifyVector = FALSE), error = function(e) NULL)
+    if (is.null(x)) return(as.data.frame(cols))
+
+    # Extract model even if analysis is NULL (for error cases)
+    cols$qa_model <- x$model %||% NA_character_
+
+    # Return early if no analysis (error case)
+    if (is.null(x$analysis)) return(as.data.frame(cols))
+    a <- x$analysis
+
+    if (!is.null(a$rubric_scores)) {
+      rs <- a$rubric_scores
+      cols$qa_template_fit <- suppressWarnings(as.numeric(rs$template_fit %||% NA))
+      cols$qa_template_structure_compliance <- suppressWarnings(as.numeric(rs$template_structure_compliance %||% NA))
+      cols$qa_cognitive_integrity <- suppressWarnings(as.numeric(rs$cognitive_integrity %||% NA))
+      cols$qa_template_boundary_discipline <- suppressWarnings(as.numeric(rs$template_boundary_discipline %||% NA))
+      cols$qa_progressive_model_principle <- suppressWarnings(as.numeric(rs$progressive_model_principle %||% NA))
+      cols$qa_lesson_economy_and_cognitive_load <- suppressWarnings(as.numeric(rs$lesson_economy_and_cognitive_load %||% NA))
+    } else if (!is.null(a$rubric)) {
+      r <- a$rubric
+      score_of <- function(node) suppressWarnings(as.numeric((node$score %||% NA)))
+      cols$qa_template_fit <- score_of(r$template_fit)
+      cols$qa_template_structure_compliance <- score_of(r$template_structure_compliance)
+      cols$qa_cognitive_integrity <- score_of(r$cognitive_integrity)
+      cols$qa_template_boundary_discipline <- score_of(r$template_boundary_discipline)
+      cols$qa_progressive_model_principle <- score_of(r$progressive_model_principle)
+      cols$qa_lesson_economy_and_cognitive_load <- score_of(r$lesson_economy_and_cognitive_load)
+    }
+    if (!is.null(a$priority_index)) {
+      # Debug: check the structure of priority_index
+      message("DEBUG extract_qa_scores: priority_index structure: ", jsonlite::toJSON(a$priority_index, auto_unbox = TRUE))
+      cols$qa_priority_index <- suppressWarnings(as.numeric(a$priority_index$priority_index %||% NA))
+      message("DEBUG extract_qa_scores: extracted qa_priority_index value: ", cols$qa_priority_index)
+    } else {
+      message("DEBUG extract_qa_scores: priority_index is NULL in analysis")
+    }
+    as.data.frame(cols)
+  }
 
 
   # Compose a distribution (top) and bars (bottom) plot with shared x-scale and aligned left axis
@@ -185,10 +239,11 @@ server <- function(input, output, session) {
     idx <- .state$idx + 1L
     lid <- .state$ids[[idx]]
 
-    # Check analysis cache (fresh within 24 hours)
+    # Check analysis cache (fresh within 7 days / 1 week)
     now_ts <- Sys.time()
-    fresh_cutoff <- now_ts - as.difftime(1, units = "days")
+    fresh_cutoff <- now_ts - as.difftime(7, units = "days")
     cached <- NULL
+
     if (!is.null(.state$analysis_cache) && nrow(.state$analysis_cache)) {
       cand <- .state$analysis_cache %>% dplyr::filter(lesson_id == lid)
       if (nrow(cand)) {
@@ -198,6 +253,8 @@ server <- function(input, output, session) {
         }
       }
     }
+    # Need to fetch content for qualitative analysis even if quantitative is cached
+    one_df <- NULL
     if (is.null(cached)) {
       # Pull single lesson only when cache is missing/stale
       conn <- DBI::dbConnect(
@@ -222,6 +279,120 @@ server <- function(input, output, session) {
       saveRDS(.state$analysis_cache, analysis_cache_file)
     } else {
       sec_tbl <- cached
+    }
+
+    # Qualitative analysis (full lesson text) if enabled
+    # This runs independently of quantitative cache status
+    if (isTRUE(.state$qualitative_enabled)) {
+      lesson_title <- tryCatch({
+        content_tree %>% dplyr::filter(lesson_id == lid) %>% dplyr::distinct(lesson) %>% dplyr::pull(lesson) %>% .[1] %||% NULL
+      }, error = function(e) NULL)
+
+      # Check if we already have a fresh SUCCESSFUL qualitative analysis for this lesson
+      # Only successful analyses should be cached - failed ones should be retried
+      existing_qual <- .state$qual_results %>% dplyr::filter(lesson_id == lid)
+      has_fresh_qual <- FALSE
+      if (nrow(existing_qual) > 0 && "qa_analyzed_at" %in% names(existing_qual) && "qa_status" %in% names(existing_qual)) {
+        qa_status <- existing_qual$qa_status[[1]]
+        qa_timestamp <- existing_qual$qa_analyzed_at[[1]]
+        # Only use cache if status is "success" and timestamp is fresh
+        if (!is.null(qa_status) && !is.na(qa_status) && qa_status == "success" &&
+            !is.null(qa_timestamp) && !is.na(qa_timestamp) && qa_timestamp >= fresh_cutoff) {
+          has_fresh_qual <- TRUE
+          message("  Using cached qualitative analysis for lesson ", lid, " (",
+                  round(as.numeric(difftime(now_ts, qa_timestamp, units = "days")), 1), " days old)")
+        } else if (!is.null(qa_status) && qa_status != "success") {
+          message("  Cached qualitative analysis for lesson ", lid, " has status '", qa_status, "' - retrying")
+        }
+      }
+
+      if (!has_fresh_qual) {
+        # Fetch content if we haven't already
+        if (is.null(one_df)) {
+          conn <- DBI::dbConnect(
+            RMariaDB::MariaDB(),
+            dbname   = 'learnable',
+            host     = '127.0.0.1',
+            port     = 2244,
+            user     = 'dbeaver',
+            password = 'shizkqhsh-18-791uwhsjw-891'
+          )
+          on.exit(DBI::dbDisconnect(conn), add = TRUE)
+          q <- paste0(
+            "SELECT CAST(l.id AS CHAR) AS lesson_id, d.content AS content ",
+            "FROM lessons l JOIN docs d ON l.doc_id = d.id ",
+            "WHERE l.id = ", DBI::dbQuoteString(conn, lid), ";"
+          )
+          one_df <- DBI::dbGetQuery(conn, q) %>% tibble::as_tibble()
+        }
+
+        lesson_text <- tryCatch({
+          get_content_text(one_df$content[[1]])$content_text %||% ""
+        }, error = function(e) "")
+        if (nchar(lesson_text) >= 100) {
+          # Get selected model from UI, default to gpt-5.1
+          selected_model <- tryCatch(input$qualitativeModel, error = function(e) "gpt-5.1")
+          if (is.null(selected_model) || selected_model == "") selected_model <- "gpt-5.1"
+
+          # Try to analyze, but continue on error
+          qres <- tryCatch({
+          analyze_lesson_qualitative(
+            lesson_text = lesson_text,
+            lesson_id = lid,
+            lesson_title = lesson_title,
+            model = selected_model
+          )
+        }, error = function(e) {
+          # Return error result
+          list(
+            lesson_id = lid,
+            lesson_title = lesson_title,
+            model = selected_model,
+            timestamp = Sys.time(),
+            elapsed_time = 0,
+            tokens = list(prompt = 0, completion = 0, total = 0),
+            analysis = NULL,
+            validation_passed = FALSE,
+            iterations = 0,
+            error = as.character(e$message),
+            status = "failed"
+          )
+        })
+
+        # Save result to JSON file (even if failed)
+        tryCatch({
+          save_analysis_result(qres, output_dir = "qualitative_analysis_results")
+        }, error = function(e) {
+          warning("Failed to save qualitative analysis result: ", e$message)
+        })
+
+        qjson <- jsonlite::toJSON(qres, auto_unbox = TRUE, null = "null")
+        scores_df <- extract_qa_scores(qjson)
+
+        # Add status column
+        status <- if (!is.null(qres$error)) "failed" else if (isTRUE(qres$validation_passed)) "success" else "validation_failed"
+
+        # Store qualitative results with timestamp
+        qual_row <- tibble::tibble(
+          lesson_id = lid,
+          qualitative_json = as.character(qjson),
+          qa_status = status,
+          qa_error = qres$error %||% NA_character_,
+          qa_analyzed_at = now_ts
+        ) %>%
+          dplyr::bind_cols(scores_df)
+
+        # Remove any existing result for this lesson_id before adding the new one
+        # This ensures retries overwrite old results
+        .state$qual_results <- .state$qual_results %>%
+          dplyr::filter(lesson_id != lid)
+
+        .state$qual_results <- dplyr::bind_rows(
+          .state$qual_results,
+          qual_row
+        )
+      }
+      }
     }
     # Backward compatibility: ensure heading-by-level columns exist on section table (cached rows may lack them)
     ensure_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6","nodes_native","nodes_custom")
@@ -248,7 +419,6 @@ server <- function(input, output, session) {
         headings_h1 = sum(headings_h1, na.rm = TRUE),
         headings_h2 = sum(headings_h2, na.rm = TRUE),
         headings_h3 = sum(headings_h3, na.rm = TRUE),
-        
         headings_h6 = sum(headings_h6, na.rm = TRUE),
         nodes_native = sum(nodes_native, na.rm = TRUE),
         nodes_custom = sum(nodes_custom, na.rm = TRUE),
@@ -266,7 +436,9 @@ server <- function(input, output, session) {
         by = "lesson_id"
       ) %>%
       dplyr::relocate(lesson, .after = lesson_id) %>%
-      dplyr::arrange(lesson_id)
+      dplyr::arrange(lesson_id) %>%
+      # Join qualitative results (lesson-level data)
+      dplyr::left_join(.state$qual_results, by = "lesson_id")
     .state$les_acc <- les_acc
     lesson_metrics_acc(.state$les_acc)
 
@@ -286,6 +458,9 @@ server <- function(input, output, session) {
     # Reset accumulators and progress and ids
     section_metrics_acc(tibble::tibble())
     lesson_metrics_acc(tibble::tibble())
+    .state$qualitative_enabled <- isTRUE(input$qualitativeEnabled)
+    # DO NOT reset qual_results - we want to preserve the cache between runs
+    # .state$qual_results is only initialized once at startup and persists
     .state$ids <- ids
     .state$total <- length(ids)
     .state$idx <- 0L
@@ -295,7 +470,7 @@ server <- function(input, output, session) {
     # Kick off processing (non-blocking)
     if (.state$total > 0L) later::later(process_next_lesson, delay = 0)
   })
-  
+
   # Preview of pulled JSON per lesson
   output$pulledContentTable <- renderDT({
     df <- pulled_content_df()
@@ -495,7 +670,12 @@ server <- function(input, output, session) {
     plt
   })
 
-  observe({
+  observeEvent({
+    list(
+      plotly::event_data("plotly_click", source = "sectionBars"),
+      plotly::event_data("plotly_selected", source = "sectionBars")
+    )
+  }, {
     ev <- safe_event_data("plotly_click", "sectionBars")
     sel <- safe_event_data("plotly_selected", "sectionBars")
     pd <- section_plot_data(); df <- pd$df
@@ -510,12 +690,13 @@ server <- function(input, output, session) {
       idx <- match(lab, as.character(df$sec_label))
       if (is.finite(idx)) selectRows(section_proxy, idx)
     }
-  })
+  }, ignoreNULL = TRUE, ignoreInit = TRUE)
 
   # ---- NEW: Lesson charts using shared scale + ggiraph ----
   lesson_plot_data <- reactive({
-    # Aggregate from section metrics to current level to ensure correctness above lesson
-    base <- section_metrics_display()
+    # Use lesson_metrics_acc as the source of truth for lesson-level data
+    # This includes both quantitative (summed from sections) and qualitative (lesson-level) metrics
+    base <- lesson_metrics_acc()
     req(!is.null(base), nrow(base) > 0, input$lessonMetric)
     m <- input$lessonMetric
     # If the requested metric column is missing, return empty safely
@@ -526,10 +707,16 @@ server <- function(input, output, session) {
     grp_by <- input$groupBy %||% "none"
     base[[m]] <- suppressWarnings(as.numeric(base[[m]]))
     base <- base[is.finite(base[[m]]), , drop = FALSE]
+
+    # Ensure lesson_id exists in base
+    if (!"lesson_id" %in% names(base)) {
+      return(list(df = tibble::tibble(node_id = character(), node = character(), value = numeric(), grp = character()), metric_name = m))
+    }
+
     if (identical(level, "lesson")) {
+      # At lesson level, base already has the correct aggregation
       df_small <- base %>%
-        dplyr::group_by(lesson_id) %>%
-        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
+        dplyr::select(lesson_id, value = dplyr::all_of(m)) %>%
         dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson, course, module, chapter) %>% dplyr::distinct(), by = "lesson_id") %>%
         dplyr::transmute(node_id = lesson_id,
                          node = dplyr::coalesce(lesson, lesson_id),
@@ -537,12 +724,18 @@ server <- function(input, output, session) {
                          value = as.numeric(value)) %>%
         dplyr::distinct(node, .keep_all = TRUE)
     } else {
+      # For higher levels (chapter/module/course), aggregate from lesson level
       if (!(level %in% names(content_tree))) return(list(df = tibble::tibble(node = character(), value = numeric()), metric_name = m))
+
+      # Determine if this is a QA metric (should use mean) or quantitative metric (should use sum)
+      is_qa_metric <- grepl("^qa_", m)
+
       df_small <- base %>%
+        dplyr::select(lesson_id, value = dplyr::all_of(m)) %>%
         dplyr::left_join(content_tree %>% dplyr::select(lesson_id, course, module, chapter, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
         dplyr::group_by(node = .data[[level]]) %>%
-        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE),
-                         grp = if (identical(grp_by, "none")) "All" else first(.data[[grp_by]]),
+        dplyr::summarise(value = if (is_qa_metric) mean(value, na.rm = TRUE) else sum(value, na.rm = TRUE),
+                         grp = if (identical(grp_by, "none")) "All" else dplyr::first(.data[[grp_by]]),
                          .groups = "drop") %>%
         dplyr::distinct(node, .keep_all = TRUE) %>%
         dplyr::mutate(node_id = as.character(node),
@@ -696,26 +889,36 @@ server <- function(input, output, session) {
 
   # Helper to compute group df for an arbitrary metric at current aggLevel
   get_group_values <- function(m) {
-    base <- section_metrics_display()
-    if (is.null(base) || nrow(base) == 0) return(tibble::tibble(node = character(), value = numeric(), grp = character()))
+    # Use lesson_metrics_acc as the source of truth (includes both quantitative and qualitative metrics)
+    base <- lesson_metrics_acc()
+    if (is.null(base) || nrow(base) == 0 || !m %in% names(base)) {
+      return(tibble::tibble(node = character(), value = numeric(), grp = character()))
+    }
     lvl <- input$aggLevel %||% "lesson"
     grp_by <- input$groupBy %||% "none"
+
+    # Convert to numeric and filter finite values
     base[[m]] <- suppressWarnings(as.numeric(base[[m]]))
     base <- base[is.finite(base[[m]]), , drop = FALSE]
+
     if (identical(lvl, "lesson")) {
+      # At lesson level, base already has the correct aggregation
       out <- base %>%
-        dplyr::group_by(lesson_id) %>%
-        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
+        dplyr::select(lesson_id, value = dplyr::all_of(m)) %>%
         dplyr::left_join(content_tree %>% dplyr::select(lesson_id, lesson, course, module, chapter) %>% dplyr::distinct(), by = "lesson_id") %>%
         dplyr::transmute(node = dplyr::coalesce(lesson, lesson_id),
                          value = as.numeric(value),
                          grp = if (identical(grp_by, "none")) "All" else .data[[grp_by]]) %>%
         dplyr::distinct(node, .keep_all = TRUE)
     } else if (lvl %in% names(content_tree)) {
+      # For higher levels, determine if QA metric (use mean) or quantitative (use sum)
+      is_qa_metric <- grepl("^qa_", m)
+
       out <- base %>%
+        dplyr::select(lesson_id, value = dplyr::all_of(m)) %>%
         dplyr::left_join(content_tree %>% dplyr::select(lesson_id, course, module, chapter, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
         dplyr::group_by(node = .data[[lvl]]) %>%
-        dplyr::summarise(value = sum(.data[[m]], na.rm = TRUE),
+        dplyr::summarise(value = if (is_qa_metric) mean(value, na.rm = TRUE) else sum(value, na.rm = TRUE),
                          grp = if (identical(grp_by, "none")) "All" else first(.data[[grp_by]]),
                          .groups = "drop") %>%
         dplyr::distinct(node, .keep_all = TRUE) %>%
@@ -1385,9 +1588,10 @@ server <- function(input, output, session) {
   # Aggregated per-lesson metrics (sums only; exclude non-countable metrics)
   lesson_metrics <- reactive({
     acc <- lesson_metrics_acc()
-    # Only trust accumulator if it already contains the latest metric columns (incl. concept-checks)
+    # Only trust accumulator if it already contains the latest metric columns (incl. concept-checks and QA)
     required_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6","nodes_native","nodes_custom",
                        "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total")
+    # Note: QA columns are optional (only present if qualitative analysis was run)
     if (!is.null(acc) && nrow(acc) > 0 && all(required_cols %in% names(acc))) return(acc)
     df <- section_metrics_refactored()
     if (is.null(df) || nrow(df) == 0) return(tibble::tibble())
@@ -1439,39 +1643,14 @@ server <- function(input, output, session) {
   })
 
   output$lessonMetricsTable <- renderDT({
+    # Use plot data as the source - it's already filtered and aggregated correctly
     pd <- tryCatch(lesson_plot_data(), error = function(e) NULL)
     if (is.null(pd) || is.null(pd$df) || !is.data.frame(pd$df)) {
       return(DT::datatable(data.frame()))
     }
-    df <- pd$df
-    # Keep a copy in case filtering throws
-    df0 <- df
-    # Filtering logic (default: show all rows; filter only when non-empty selection)
-    res <- tryCatch({
-      filt <- lesson_filter()
-      sm <- selected_members()
-      sel_labels <- if (is.null(sm)) character(0) else as.character(sm)
-      if (!is.null(filt) && identical(filt$type, "labels")) {
-        vals <- filt$values
-        vals <- if (is.null(vals)) character(0) else as.character(vals)
-        if (length(vals)) sel_labels <- unique(c(sel_labels, vals))
-      }
-      if (length(sel_labels) > 0) {
-        df %>% dplyr::mutate(node = as.character(.data$node)) %>% dplyr::filter(.data$node %in% sel_labels)
-      } else if (!is.null(filt) && identical(filt$type, "range") && length(filt$values) == 2) {
-        m <- isolate(input$lessonMetric)
-        if (!is.null(m) && m %in% names(df0)) {
-          rng <- sort(as.numeric(filt$values))
-          df %>% dplyr::filter(is.finite(.data[[m]]) & .data[[m]] >= rng[1] & .data[[m]] <= rng[2])
-        } else {
-          df
-        }
-      } else {
-        df
-      }
-    }, error = function(e) df0)
-    # Build display table to match the bar chart data
-    tbl <- res %>%
+
+    # Build display table showing the selected metric
+    tbl <- pd$df %>%
       dplyr::transmute(
         id = .data$node_id %||% as.character(.data$node),
         node = as.character(.data$node),
@@ -1479,12 +1658,14 @@ server <- function(input, output, session) {
         metric = isolate(input$lessonMetric) %||% pd$metric_name,
         value = .data$value
       )
+
     DT::datatable(
       tbl,
       rownames = FALSE,
       options = list(pageLength = 10, scrollX = TRUE),
       selection = 'single'
-    )
+    ) %>%
+      DT::formatRound(columns = "value", digits = 2)
   })
 
   # Metric selection and distribution plot for Lesson Analysis
@@ -1493,7 +1674,10 @@ server <- function(input, output, session) {
     "blocks_total","words_sum","headings_count","headings_h1","headings_h2","headings_h3","headings_h6","images_count",
     "tables_count","lists_count","latex_total","latex_inline",
     "latex_display","latex_display_multi","nodes_native","nodes_custom",
-    "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total"
+    "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total",
+    "qa_template_fit","qa_template_structure_compliance","qa_cognitive_integrity",
+    "qa_template_boundary_discipline","qa_progressive_model_principle",
+    "qa_lesson_economy_and_cognitive_load","qa_priority_index"
   )
 
   observe({
@@ -1536,9 +1720,13 @@ server <- function(input, output, session) {
     les <- lesson_metrics()
     if (is.null(les) || nrow(les) == 0) return(tibble::tibble())
     # Ensure heading-by-level cols exist
-    ensure_cols <- c("headings_h1","headings_h2","headings_h3","headings_h6","nodes_native","nodes_custom",
-                     "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total")
-    for (nm in setdiff(ensure_cols, names(les))) les[[nm]] <- 0L
+    ensure_cols_zero <- c("headings_h1","headings_h2","headings_h3","headings_h6","nodes_native","nodes_custom",
+                          "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total")
+    ensure_cols_na <- c("qa_template_fit","qa_template_structure_compliance","qa_cognitive_integrity",
+                        "qa_template_boundary_discipline","qa_progressive_model_principle",
+                        "qa_lesson_economy_and_cognitive_load","qa_priority_index")
+    for (nm in setdiff(ensure_cols_zero, names(les))) les[[nm]] <- 0L
+    for (nm in setdiff(ensure_cols_na, names(les))) les[[nm]] <- NA_real_
     if (identical(level, "lesson")) {
       # Use lesson title for labels instead of lesson_id; fall back to id if title absent
       if ("lesson" %in% names(les)) {
@@ -1582,6 +1770,14 @@ server <- function(input, output, session) {
         latex_inline = sum(latex_inline, na.rm = TRUE),
         latex_display = sum(latex_display, na.rm = TRUE),
         latex_display_multi = sum(latex_display_multi, na.rm = TRUE),
+        # QA metrics: average instead of sum (these are scores, not counts)
+        qa_template_fit = mean(qa_template_fit, na.rm = TRUE),
+        qa_template_structure_compliance = mean(qa_template_structure_compliance, na.rm = TRUE),
+        qa_cognitive_integrity = mean(qa_cognitive_integrity, na.rm = TRUE),
+        qa_template_boundary_discipline = mean(qa_template_boundary_discipline, na.rm = TRUE),
+        qa_progressive_model_principle = mean(qa_progressive_model_principle, na.rm = TRUE),
+        qa_lesson_economy_and_cognitive_load = mean(qa_lesson_economy_and_cognitive_load, na.rm = TRUE),
+        qa_priority_index = mean(qa_priority_index, na.rm = TRUE),
         .groups = "drop"
       ) %>%
       dplyr::rename(node = !!rlang::sym(level)) %>%
@@ -1786,6 +1982,242 @@ server <- function(input, output, session) {
       cached_lesson_text = cached_lesson_text,
       content_tree = content_tree
     )
+  })
+
+  # Qualitative Analysis tab: distribution plot
+  output$qualitativePlotly <- plotly::renderPlotly({
+    df <- lesson_metrics_acc()
+    if (is.null(df) || nrow(df) == 0 || !"qa_priority_index" %in% names(df)) {
+      return(plotly::plotly_empty())
+    }
+
+    # Filter to only lessons with priority index
+    df_plot <- df %>%
+      dplyr::filter(!is.na(qa_priority_index)) %>%
+      dplyr::select(lesson_id, lesson, qa_priority_index, qa_status)
+
+    if (nrow(df_plot) == 0) {
+      return(plotly::plotly_empty())
+    }
+
+    dist_type <- if (!is.null(input$qualitativeDist) && identical(input$qualitativeDist, "Boxplot")) "box" else "hist"
+    xr <- range(c(0, df_plot$qa_priority_index), na.rm = TRUE)
+
+    if (identical(dist_type, "box")) {
+      # Boxplot with jittered points below
+      plt <- plotly::plot_ly() %>%
+        plotly::add_trace(
+          x = df_plot$qa_priority_index,
+          type = "box",
+          orientation = "h",
+          name = "Priority Index",
+          fillcolor = "#8DD3C7",
+          marker = list(color = "#8DD3C7"),
+          line = list(color = "black", width = 1),
+          boxpoints = FALSE,  # Don't show default points
+          hoverinfo = "x"
+        ) %>%
+        plotly::add_trace(
+          x = df_plot$qa_priority_index,
+          y = stats::runif(nrow(df_plot), -0.3, -0.1),  # Jitter below the box
+          type = "scatter",
+          mode = "markers",
+          marker = list(
+            size = 8,
+            color = "#8DD3C7",
+            line = list(color = "black", width = 0.5)
+          ),
+          text = ~paste0(df_plot$lesson, " (", df_plot$lesson_id, ")"),
+          hovertemplate = "%{text}: %{x}<extra></extra>",
+          showlegend = FALSE
+        ) %>%
+        plotly::layout(
+          yaxis = list(title = "", showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE, range = c(-0.5, 0.5)),
+          xaxis = list(title = "Priority Index", range = c(xr[1], xr[2])),
+          showlegend = FALSE,
+          margin = list(l = 60, r = 20, t = 20, b = 40)
+        )
+    } else {
+      # Histogram
+      plt <- plotly::plot_ly() %>%
+        plotly::add_trace(
+          x = df_plot$qa_priority_index,
+          type = "histogram",
+          nbinsx = 20,
+          name = "Priority Index",
+          marker = list(color = "#8DD3C7", line = list(color = "black", width = 0.5)),
+          opacity = 0.7
+        ) %>%
+        plotly::layout(
+          yaxis = list(title = "Count"),
+          xaxis = list(title = "Priority Index", range = c(xr[1], xr[2])),
+          showlegend = FALSE,
+          margin = list(l = 60, r = 20, t = 20, b = 40)
+        )
+    }
+
+    plt %>%
+      plotly::config(
+        displaylogo = FALSE,
+        modeBarButtonsToRemove = c(
+          'zoom2d','pan2d','lasso2d','zoomIn2d','zoomOut2d',
+          'hoverClosestCartesian','hoverCompareCartesian','toggleSpikelines'
+        )
+      )
+  })
+
+  # Qualitative Analysis tab: table and modal reasoning viewer
+  output$qualitativeResultsTable <- DT::renderDT({
+    df <- lesson_metrics_acc()
+    if (is.null(df) || nrow(df) == 0) {
+      return(DT::datatable(data.frame()))
+    }
+
+    # Select only the columns we want to show + qualitative_json for modal
+    display_cols <- c("lesson_id", "lesson", "qa_status", "qa_priority_index")
+
+    out <- df %>%
+      dplyr::select(dplyr::any_of(c(display_cols, "qualitative_json", "qa_error")))
+
+    # Only proceed if we have the qualitative_json column
+    if (nrow(out) == 0 || !"qualitative_json" %in% names(out)) {
+      return(DT::datatable(out, options = list(pageLength = 10, scrollX = TRUE), selection = 'single'))
+    }
+
+    # Store qualitative_json for the modal, then remove hidden columns from display
+    # This is cleaner than trying to hide columns with DataTables
+    qualitative_data <- out$qualitative_json
+
+    # Keep only the display columns
+    display_out <- out %>%
+      dplyr::select(lesson_id, lesson, qa_status, qa_priority_index)
+
+    # Rename to friendly names
+    names(display_out) <- c("Lesson ID", "Lesson", "Status", "Priority Index")
+
+    DT::datatable(
+      display_out,
+      options = list(
+        pageLength = 10,
+        scrollX = TRUE
+      ),
+      selection = 'single'
+    )
+  })
+
+  observeEvent(input$qualitativeResultsTable_rows_selected, {
+    idx <- input$qualitativeResultsTable_rows_selected
+    df <- tryCatch(lesson_metrics_acc(), error = function(e) NULL)
+    if (is.null(idx) || length(idx) != 1 || is.null(df) || nrow(df) < idx) return()
+    row <- df[idx, , drop = FALSE]
+    qjson <- tryCatch(as.character(row$qualitative_json[[1]]), error = function(e) "")
+    a <- tryCatch(jsonlite::fromJSON(qjson, simplifyVector = FALSE), error = function(e) NULL)
+
+    # Build formatted display
+    content_parts <- list()
+
+    if (!is.null(a) && !is.null(a$analysis)) {
+      analysis <- a$analysis
+
+      # Lesson Typing Section
+      if (!is.null(analysis$lesson_typing)) {
+        lt <- analysis$lesson_typing
+        typing_text <- paste0(
+          "Stated Type: ", lt$stated_type$stage %||% "N/A", " / ", lt$stated_type$sub_type %||% "N/A", "\n",
+          "Inferred Type: ", lt$inferred_type$stage %||% "N/A", " / ", lt$inferred_type$sub_type %||% "N/A", "\n",
+          "Justification: ", lt$typing_justification %||% "N/A"
+        )
+        content_parts[[length(content_parts) + 1]] <- tagList(
+          tags$h4("Lesson Typing"),
+          tags$pre(typing_text)
+        )
+      }
+
+      # Rubric Scores Section
+      if (!is.null(analysis$rubric)) {
+        rubric <- analysis$rubric
+        rubric_text <- paste(
+          paste0("Template Fit: ", rubric$template_fit$score %||% "?", "/3 - ", rubric$template_fit$reason %||% ""),
+          paste0("Structure Compliance: ", rubric$template_structure_compliance$score %||% "?", "/3 - ", rubric$template_structure_compliance$reason %||% ""),
+          paste0("Cognitive Integrity: ", rubric$cognitive_integrity$score %||% "?", "/3 - ", rubric$cognitive_integrity$reason %||% ""),
+          paste0("Boundary Discipline: ", rubric$template_boundary_discipline$score %||% "?", "/3 - ", rubric$template_boundary_discipline$reason %||% ""),
+          paste0("Progressive Model: ", rubric$progressive_model_principle$score %||% "?", "/3 - ", rubric$progressive_model_principle$reason %||% ""),
+          paste0("Lesson Economy & Load: ", rubric$lesson_economy_and_cognitive_load$score %||% "?", "/3 - ", rubric$lesson_economy_and_cognitive_load$reason %||% ""),
+          sep = "\n\n"
+        )
+        content_parts[[length(content_parts) + 1]] <- tagList(
+          tags$h4("Rubric Scores"),
+          tags$pre(rubric_text)
+        )
+      }
+
+      # Priority Index Section
+      if (!is.null(analysis$priority_index)) {
+        pi <- analysis$priority_index
+        priority_text <- paste(
+          paste0("Priority Index: ", pi$priority_index %||% "N/A"),
+          paste0("Priority Band: ", pi$priority_band %||% "N/A"),
+          paste0("Base Sum: ", pi$base_sum %||% "N/A"),
+          paste0("Overload Factor: ", pi$overload_factor %||% "N/A"),
+          paste0("Explanation: ", pi$priority_explanation %||% "N/A"),
+          sep = "\n"
+        )
+        content_parts[[length(content_parts) + 1]] <- tagList(
+          tags$h4("Priority Index"),
+          tags$pre(priority_text)
+        )
+      }
+
+      # Atomic Lesson Assessment
+      if (!is.null(analysis$atomic_lesson_assessment)) {
+        ala <- analysis$atomic_lesson_assessment
+        atomic_text <- paste0(
+          "Is Single Atomic Lesson: ", ala$is_single_atomic_lesson %||% "N/A", "\n",
+          "Number of Arcs: ", length(ala$arcs) %||% 0
+        )
+        content_parts[[length(content_parts) + 1]] <- tagList(
+          tags$h4("Atomic Lesson Assessment"),
+          tags$pre(atomic_text)
+        )
+      }
+
+      # Metadata
+      meta_parts <- c(
+        paste0("Model: ", a$model %||% "N/A"),
+        paste0("Validation Passed: ", a$validation_passed %||% "N/A"),
+        paste0("Iterations: ", a$iterations %||% "N/A"),
+        paste0("Elapsed Time: ", round(a$elapsed_time %||% 0, 1), " seconds"),
+        paste0("Total Tokens: ", a$tokens$total %||% "N/A")
+      )
+
+      # Add validation errors if present and validation failed
+      if (!is.null(a$final_errors) && length(a$final_errors) > 0) {
+        meta_parts <- c(
+          meta_parts,
+          "",
+          "Validation Errors:",
+          paste0("  ", seq_along(a$final_errors), ". ", a$final_errors)
+        )
+      }
+
+      meta_text <- paste(meta_parts, collapse = "\n")
+
+      content_parts[[length(content_parts) + 1]] <- tagList(
+        tags$h4("Analysis Metadata"),
+        tags$pre(meta_text)
+      )
+    }
+
+    showModal(modalDialog(
+      title = paste("Qualitative Analysis - Lesson", as.character(row$lesson_id %||% "")),
+      tagList(
+        if (length(content_parts) > 0) content_parts else tags$em("No analysis data available."),
+        tags$hr(),
+        tags$details(tags$summary("Raw JSON"), tags$pre(qjson))
+      ),
+      easyClose = TRUE,
+      size = "l"
+    ))
   })
   
 }

@@ -18,6 +18,12 @@ ui <- fluidPage(
       tags$div(
         style = "margin-bottom: 12px; display: flex; align-items: center; gap: 12px;",
         actionButton("pullContent", "Analyse content"),
+        checkboxInput("qualitativeEnabled", "Qualtitative Analysis", value = FALSE),
+        selectInput("qualitativeModel", "Model",
+          choices = c("gpt-5.1", "gpt-5.1-2025-11-13", "gpt-5.1-chat-latest", "gpt-5-mini", "gpt-4o", "gpt-4.1", "gpt-4o-mini"),
+          selected = "gpt-5.1",
+          width = "200px"
+        ),
         tags$span(textOutput("analysisProgress", inline = TRUE), style = "color:#666;")
       ),
       tabsetPanel(
@@ -73,6 +79,20 @@ ui <- fluidPage(
               plotly::plotlyOutput("metricMatrixPlot", height = "560px")
             )
           )
+        ),
+        tabPanel("Qualitative Analysis",
+                 div(
+                   div(style = "max-width: 960px; margin: 0 auto;",
+                       div(style = "display:flex; gap:16px; align-items:center; margin-bottom:12px;",
+                           selectInput("qualitativeDist", "Distribution",
+                                      choices = c("Boxplot","Histogram"),
+                                      selected = "Boxplot",
+                                      width = "200px")
+                       ),
+                       plotly::plotlyOutput("qualitativePlotly", height = "300px"),
+                       DTOutput("qualitativeResultsTable")
+                   )
+                 )
         )
       )
     )
