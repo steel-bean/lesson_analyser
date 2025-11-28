@@ -1,0 +1,778 @@
+---
+title: "Qualitative Lesson Analysis Pipeline"
+author: "WB"
+date: "2025-11-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Qualitative Lesson Analysis Pipeline
+
+This pipeline performs qualitative analysis of Learnable lessons using OpenAI's API.
+
+## 1. Load Dependencies and Global Setup
+
+```{r dependencies}
+# Source global setup (database connection, caching, text extraction functions)
+source("get_analysis_global.R")
+
+# Additional packages for API calls
+library(httr)
+library(jsonlite)
+library(dotenv)
+library(purrr)
+library(glue)
+
+# Load environment variables for API key
+load_dot_env()
+```
+
+## 2. Configuration
+
+```{r config}
+# OpenAI API configuration
+get_openai_key <- function() {
+  api_key <- Sys.getenv("OPENAI_API_KEY")
+  if (api_key == "") {
+    stop("OPENAI_API_KEY not found in environment variables")
+  }
+  api_key
+}
+
+# Available models for analysis
+AVAILABLE_MODELS <- c(
+  "gpt-4o",
+  "gpt-4.1",
+  "gpt-4o-mini",
+  "gpt-5.1",                    # GPT-5.1 (released Nov 2025)
+  "gpt-5.1-2025-11-13",         # Versioned identifier
+  "gpt-5.1-chat-latest"         # GPT-5.1 Instant
+)
+
+# Default model for qualitative analysis
+DEFAULT_MODEL <- "gpt-5.1"
+
+# API endpoint configuration
+# All models use the standard chat completions endpoint
+OPENAI_API_URL <- "https://api.openai.com/v1/chat/completions"
+
+get_api_endpoint <- function(model) {
+  OPENAI_API_URL
+}
+
+# Check if model is GPT-5.1 (supports adaptive reasoning)
+is_gpt5_model <- function(model) {
+  grepl("^gpt-5", model, ignore.case = TRUE)
+}
+
+
+
+# Load instructions
+INSTRUCTIONS_FILE <- "lesson_analyser_instructions.txt"
+SCHEMA_FILE <- "qa_schema.json"
+```
+
+## 3. Load Analysis Instructions and Schema
+
+```{r load_instructions}
+# Load the qualitative analysis instructions
+load_analysis_instructions <- function(file_path = INSTRUCTIONS_FILE) {
+  if (!file.exists(file_path)) {
+    stop(glue("Instructions file not found: {file_path}"))
+  }
+
+  instructions <- paste(readLines(file_path, warn = FALSE), collapse = "\n")
+  message("✅ Loaded analysis instructions (", nchar(instructions), " chars)")
+  instructions
+}
+
+# Load the JSON schema for validation
+load_analysis_schema <- function(file_path = SCHEMA_FILE) {
+  if (!file.exists(file_path)) {
+    stop(glue("Schema file not found: {file_path}"))
+  }
+
+  schema <- fromJSON(file_path, simplifyVector = FALSE)
+  message("✅ Loaded analysis schema")
+  schema
+}
+
+qa_instructions <- load_analysis_instructions()
+qa_schema <- load_analysis_schema()
+```
+
+## 4. API Communication Functions
+
+```{r api_functions}
+# Send request to OpenAI API with retry logic
+send_openai_request <- function(
+  api_key,
+  messages,
+  model = DEFAULT_MODEL,
+  max_tokens = 4000,
+  temperature = 1,
+  retries = 3,
+  reasoning_effort = "medium"  # For GPT-5.1: "low", "medium", "high", or "none"
+) {
+
+  if (!is.character(api_key) || nchar(api_key) < 20) {
+    stop("Invalid API key")
+  }
+
+  if (!is.list(messages) || length(messages) == 0) {
+    stop("Messages must be a non-empty list")
+  }
+
+  message("  → Sending request to OpenAI (model: ", model, ")")
+
+  # Build request body based on model type
+  request_body <- list(
+    model = model,
+    messages = messages
+  )
+
+  # GPT-5.1 uses max_completion_tokens and supports reasoning_effort
+  if (is_gpt5_model(model)) {
+    request_body$max_completion_tokens <- max_tokens
+    request_body$temperature <- temperature
+    request_body$response_format <- list(type = "json_object")
+    # Add reasoning_effort for adaptive reasoning control
+    if (!is.null(reasoning_effort) && reasoning_effort != "") {
+      request_body$reasoning_effort <- reasoning_effort
+      message("  ℹ️ GPT-5.1 adaptive reasoning: ", reasoning_effort)
+    }
+  } else {
+    # Standard GPT-4 models
+    request_body$max_tokens <- max_tokens
+    request_body$temperature <- temperature
+    request_body$response_format <- list(type = "json_object")
+  }
+
+  for (attempt in 1:retries) {
+    response <- tryCatch({
+      POST(
+        url = get_api_endpoint(model),
+        add_headers(
+          Authorization = paste("Bearer", api_key),
+          `Content-Type` = "application/json"
+        ),
+        encode = "json",
+        body = request_body,
+        timeout(120)
+      )
+    }, error = function(e) {
+      message("❌ Request error: ", e$message)
+      NULL
+    })
+
+    if (is.null(response)) {
+      if (attempt < retries) {
+        wait_time <- 2^attempt
+        message("⏳ Retrying in ", wait_time, " seconds...")
+        Sys.sleep(wait_time)
+        next
+      } else {
+        stop("Failed to connect to OpenAI API after ", retries, " attempts")
+      }
+    }
+
+    status <- status_code(response)
+
+    if (status == 200) {
+      parsed <- fromJSON(content(response, as = "text", encoding = "UTF-8"), flatten = TRUE)
+      message("✅ Request successful")
+      return(parsed)
+    } else if (status == 429) {
+      wait_time <- 2^attempt
+      message("⚠️ Rate limit hit. Retrying in ", wait_time, " seconds...")
+      Sys.sleep(wait_time)
+    } else {
+      error_content <- content(response, as = "text", encoding = "UTF-8")
+      error_msg <- tryCatch({
+        error_json <- fromJSON(error_content)
+        if (!is.null(error_json$error$message)) {
+          error_json$error$message
+        } else {
+          error_content
+        }
+      }, error = function(e) error_content)
+
+      message("❌ API error (status ", status, ")")
+      message("   Error details: ", error_msg)
+
+      # For 400 errors, show the request body for debugging
+      if (status == 400) {
+        message("   Request model: ", request_body$model)
+        message("   Request had ", length(request_body$messages), " messages")
+      }
+
+      stop("API request failed with status ", status, ": ", error_msg)
+    }
+  }
+
+  stop("Max retries reached")
+}
+
+# Extract and validate the assistant's response
+extract_analysis_response <- function(api_response) {
+  if (is.null(api_response$choices) || length(api_response$choices) == 0) {
+    stop("No choices in API response")
+  }
+
+  # Extract the message content
+  content <- api_response$choices$message.content[1]
+
+  if (is.null(content) || content == "") {
+    stop("Empty content in API response")
+  }
+
+  # Parse JSON response
+  analysis <- tryCatch({
+    fromJSON(content, simplifyVector = FALSE)
+  }, error = function(e) {
+    message("❌ Failed to parse JSON response: ", e$message)
+    message("Raw content: ", substr(content, 1, 500))
+    NULL
+  })
+
+  if (is.null(analysis)) {
+    return(NULL)
+  }
+
+  # Extract token usage
+  tokens <- list(
+    prompt = api_response$usage$prompt_tokens %||% NA,
+    completion = api_response$usage$completion_tokens %||% NA,
+    total = api_response$usage$total_tokens %||% NA
+  )
+
+  list(
+    analysis = analysis,
+    tokens = tokens,
+    finish_reason = api_response$choices$finish_reason[1]
+  )
+}
+
+# Validate analysis against schema (basic validation - for backward compatibility)
+validate_analysis_structure <- function(analysis, schema) {
+  result <- validate_analysis_with_feedback(analysis, schema)
+  return(result$is_valid)
+}
+
+# Enhanced validation with detailed feedback for correction loop
+# Now dynamically parses the schema instead of using hardcoded validation
+validate_analysis_with_feedback <- function(analysis, schema) {
+  errors <- character()
+
+  # Helper: recursively validate an object against a schema node
+  validate_node <- function(data, schema_node, path = "") {
+    node_errors <- character()
+
+    # Get the schema properties - handle both direct properties and nested type definitions
+    schema_props <- schema_node$properties
+    if (is.null(schema_props) && !is.null(schema_node$type)) {
+      # This might be a type reference, not a properties object
+      return(node_errors)
+    }
+
+    # Check for required fields if specified in schema
+    if (!is.null(schema_node$required)) {
+      required_fields <- unlist(schema_node$required)
+      missing_fields <- setdiff(required_fields, names(data))
+
+      if (length(missing_fields) > 0) {
+        field_path <- if (nchar(path) > 0) paste0(path, ".") else ""
+        node_errors <- c(node_errors,
+          paste0("Missing required field(s) at '", field_path, "': ",
+                 paste(missing_fields, collapse = ", ")))
+      }
+    }
+
+    # Validate each property that exists in the schema
+    if (!is.null(schema_props)) {
+      for (prop_name in names(schema_props)) {
+        prop_schema <- schema_props[[prop_name]]
+        field_path <- if (nchar(path) > 0) paste0(path, ".", prop_name) else prop_name
+
+        # Skip if this field isn't in the data
+        if (!prop_name %in% names(data)) {
+          next
+        }
+
+        prop_data <- data[[prop_name]]
+
+        # Validate type
+        expected_type <- prop_schema$type
+        if (!is.null(expected_type)) {
+          # Handle array types (can be multiple types like ["string", "null"])
+          if (is.list(expected_type)) {
+            expected_type <- expected_type[[1]]  # Use first type
+          }
+
+          valid_type <- FALSE
+          if (expected_type == "object") {
+            valid_type <- is.list(prop_data) && !is.null(names(prop_data))
+          } else if (expected_type == "array") {
+            valid_type <- is.list(prop_data)
+          } else if (expected_type == "string") {
+            valid_type <- is.character(prop_data)
+          } else if (expected_type == "integer") {
+            valid_type <- is.numeric(prop_data) && prop_data == round(prop_data)
+          } else if (expected_type == "number") {
+            valid_type <- is.numeric(prop_data)
+          } else if (expected_type == "boolean") {
+            valid_type <- is.logical(prop_data)
+          }
+
+          if (!valid_type) {
+            node_errors <- c(node_errors,
+              paste0("Field '", field_path, "' has incorrect type. Expected: ",
+                     expected_type, ", Got: ", class(prop_data)[1]))
+          }
+        }
+
+        # Validate integer range (minimum/maximum)
+        if (!is.null(prop_schema$minimum) && is.numeric(prop_data)) {
+          if (prop_data < prop_schema$minimum) {
+            node_errors <- c(node_errors,
+              paste0("Field '", field_path, "' value ", prop_data,
+                     " is below minimum ", prop_schema$minimum))
+          }
+        }
+        if (!is.null(prop_schema$maximum) && is.numeric(prop_data)) {
+          if (prop_data > prop_schema$maximum) {
+            node_errors <- c(node_errors,
+              paste0("Field '", field_path, "' value ", prop_data,
+                     " exceeds maximum ", prop_schema$maximum))
+          }
+        }
+
+        # Validate enum values
+        if (!is.null(prop_schema$enum)) {
+          valid_values <- unlist(prop_schema$enum)
+          # Filter out NULL from valid values for comparison
+          valid_values_non_null <- valid_values[!sapply(valid_values, is.null)]
+          if (!is.null(prop_data) && !prop_data %in% valid_values_non_null) {
+            node_errors <- c(node_errors,
+              paste0("Field '", field_path, "' has invalid value '", prop_data,
+                     "'. Must be one of: ", paste(valid_values_non_null, collapse = ", ")))
+          }
+        }
+
+        # Recurse into nested objects
+        if (expected_type == "object" && is.list(prop_data) && !is.null(prop_schema$properties)) {
+          nested_errors <- validate_node(prop_data, prop_schema, field_path)
+          node_errors <- c(node_errors, nested_errors)
+        }
+
+        # Validate array items
+        if (expected_type == "array" && is.list(prop_data) && !is.null(prop_schema$items)) {
+          for (i in seq_along(prop_data)) {
+            item_path <- paste0(field_path, "[", i, "]")
+            if (!is.null(prop_schema$items$properties)) {
+              item_errors <- validate_node(prop_data[[i]], prop_schema$items, item_path)
+              node_errors <- c(node_errors, item_errors)
+            }
+          }
+        }
+      }
+    }
+
+    return(node_errors)
+  }
+
+  # Run validation
+  errors <- validate_node(analysis, schema, "")
+
+  # Build feedback message
+  if (length(errors) > 0) {
+    feedback_message <- paste0(
+      "The JSON response has the following validation errors:\n\n",
+      paste(paste0(seq_along(errors), ". ", errors), collapse = "\n"),
+      "\n\n**Instructions for correction:**\n",
+      "- Ensure all field names use snake_case (e.g., 'lesson_typing', not 'Lesson Typing')\n",
+      "- All rubric dimensions must be objects with 'score' (integer 0-3) and 'reason' (string) fields\n",
+      "- Check that all required fields are present\n",
+      "- Verify that numeric values are within the specified ranges\n",
+      "- Ensure enum fields contain only valid values\n\n",
+      "Please correct these issues and return a complete, valid JSON object that exactly matches the schema."
+    )
+
+    return(list(
+      is_valid = FALSE,
+      errors = errors,
+      feedback_message = feedback_message
+    ))
+  }
+
+  message("✅ Analysis structure validated")
+  return(list(is_valid = TRUE, errors = NULL, feedback_message = NULL))
+}
+```
+
+## 5. Main Analysis Function with Validation Loop
+
+```{r main_analysis}
+# Analyze a single lesson using OpenAI API with validation loop
+analyze_lesson_qualitative <- function(
+  lesson_text,
+  lesson_id = NULL,
+  lesson_title = NULL,
+  model = DEFAULT_MODEL,
+  api_key = NULL,
+  include_metadata = TRUE,
+  max_iterations = 3,
+  reasoning_effort = "medium"  # For GPT-5.1: "low", "medium", "high", or "none"
+) {
+
+  start_time <- Sys.time()
+
+  # Get API key
+  if (is.null(api_key)) {
+    api_key <- get_openai_key()
+  }
+
+  # Validate inputs
+  if (is.null(lesson_text) || nchar(lesson_text) < 100) {
+    stop("Lesson text is too short or missing")
+  }
+
+  # Estimate token usage
+  estimated_tokens <- nchar(lesson_text) / 4 + nchar(qa_instructions) / 4
+  message("📊 Estimated input tokens: ~", round(estimated_tokens))
+
+  if (estimated_tokens > 25000) {
+    warning("⚠️ Lesson text is very long and may exceed model limits")
+  }
+
+  # Build metadata preamble if requested
+  metadata_text <- ""
+  if (include_metadata && (!is.null(lesson_id) || !is.null(lesson_title))) {
+    metadata_parts <- c()
+    if (!is.null(lesson_id)) {
+      metadata_parts <- c(metadata_parts, paste("Lesson ID:", lesson_id))
+    }
+    if (!is.null(lesson_title)) {
+      metadata_parts <- c(metadata_parts, paste("Lesson Title:", lesson_title))
+    }
+    metadata_text <- paste(
+      "\n\n--- Lesson Metadata ---\n",
+      paste(metadata_parts, collapse = "\n"),
+      "\n--- End Metadata ---\n\n",
+      sep = ""
+    )
+  }
+
+  # Construct the user prompt
+  user_prompt <- paste0(
+    metadata_text,
+    "--- Lesson Content ---\n\n",
+    lesson_text,
+    "\n\n--- End Lesson Content ---\n\n",
+    "Please analyze this lesson according to the instructions and return a JSON object matching the schema provided in the system instructions."
+  )
+
+  # Build initial message list
+  messages <- list(
+    list(role = "system", content = qa_instructions),
+    list(role = "user", content = user_prompt)
+  )
+
+  # Initialize token counters
+  total_token_count <- 0
+  prompt_token_count <- 0
+  completion_token_count <- 0
+
+  # Validation loop (similar to airlab chat_loop_stepwise)
+  message("🚀 Starting qualitative analysis with validation loop...")
+
+  for (iteration in 1:max_iterations) {
+    message("🔄 Iteration ", iteration, "/", max_iterations)
+
+    # Send request
+    api_response <- send_openai_request(
+      api_key = api_key,
+      messages = messages,
+      model = model,
+      max_tokens = 4000,
+      temperature = 1,
+      reasoning_effort = reasoning_effort
+    )
+
+    # Extract analysis
+    extracted <- extract_analysis_response(api_response)
+
+    if (is.null(extracted)) {
+      stop("Failed to extract analysis from API response")
+    }
+
+    # Accumulate token counts
+    total_token_count <- total_token_count + extracted$tokens$total
+    prompt_token_count <- prompt_token_count + extracted$tokens$prompt
+    completion_token_count <- completion_token_count + extracted$tokens$completion
+
+    # Validate structure
+    validation_result <- validate_analysis_with_feedback(extracted$analysis, qa_schema)
+
+    if (validation_result$is_valid) {
+      # Success - return result
+      elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+
+      result <- list(
+        lesson_id = lesson_id,
+        lesson_title = lesson_title,
+        model = model,
+        timestamp = Sys.time(),
+        elapsed_time = elapsed_time,
+        tokens = list(
+          prompt = prompt_token_count,
+          completion = completion_token_count,
+          total = total_token_count
+        ),
+        analysis = extracted$analysis,
+        validation_passed = TRUE,
+        iterations = iteration
+      )
+
+      message("✅ Analysis complete in ", round(elapsed_time, 1), " seconds")
+      message("📊 Total tokens used: ", total_token_count,
+              " (prompt: ", prompt_token_count,
+              ", completion: ", completion_token_count, ")")
+      message("🔁 Converged after ", iteration, " iteration(s)")
+
+      return(result)
+    } else {
+      # Validation failed - add feedback to conversation
+      message("⚠️ Validation failed on iteration ", iteration)
+      message("   Errors: ", paste(validation_result$errors, collapse = "; "))
+
+      # Add assistant's response and user feedback to conversation
+      messages <- append(messages, list(
+        list(role = "assistant", content = toJSON(extracted$analysis, auto_unbox = TRUE)),
+        list(role = "user", content = validation_result$feedback_message)
+      ))
+
+      # Continue to next iteration
+      if (iteration < max_iterations) {
+        message("   Retrying with feedback...")
+        Sys.sleep(1)  # Brief pause
+      }
+    }
+  }
+
+  # If we get here, validation failed after all iterations
+  elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+
+  warning("❌ Analysis failed validation after ", max_iterations, " iterations")
+
+  result <- list(
+    lesson_id = lesson_id,
+    lesson_title = lesson_title,
+    model = model,
+    timestamp = Sys.time(),
+    elapsed_time = elapsed_time,
+    tokens = list(
+      prompt = prompt_token_count,
+      completion = completion_token_count,
+      total = total_token_count
+    ),
+    analysis = extracted$analysis,
+    validation_passed = FALSE,
+    iterations = max_iterations,
+    final_errors = validation_result$errors
+  )
+
+  return(result)
+}
+```
+
+## 6. Save and Load Results
+
+```{r save_load}
+# Save a single analysis result with pretty formatting for easy inspection
+save_analysis_result <- function(result, output_dir = "qualitative_analysis_results") {
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+    message("📁 Created output directory: ", output_dir)
+  }
+
+  # Create filename with lesson ID and timestamp
+  filename <- paste0(
+    "lesson_",
+    result$lesson_id,
+    "_",
+    format(result$timestamp, "%Y%m%d_%H%M%S"),
+    ".json"
+  )
+
+  filepath <- file.path(output_dir, filename)
+
+  # Write JSON with pretty formatting for easy inspection
+  write_json(
+    result,
+    filepath,
+    pretty = TRUE,
+    auto_unbox = TRUE,
+    null = "null"
+  )
+
+  message("💾 Saved analysis to: ", filepath)
+  invisible(filepath)
+}
+
+# Load a saved analysis result
+load_analysis_result <- function(filepath) {
+  if (!file.exists(filepath)) {
+    stop("File not found: ", filepath)
+  }
+
+  result <- fromJSON(filepath, simplifyVector = FALSE)
+  message("✅ Loaded analysis from: ", filepath)
+  result
+}
+
+# Helper function to view just the analysis portion (without metadata)
+view_analysis <- function(result) {
+  result$analysis
+}
+
+# Helper function to create a human-readable summary of a result
+summarize_result <- function(result) {
+  analysis <- result$analysis
+
+  cat("=== LESSON ANALYSIS SUMMARY ===\n\n")
+  cat("Lesson ID:", result$lesson_id, "\n")
+  cat("Lesson Title:", result$lesson_title %||% "N/A", "\n")
+  cat("Model:", result$model, "\n")
+  cat("Timestamp:", format(result$timestamp), "\n")
+  cat("Elapsed Time:", round(result$elapsed_time, 1), "seconds\n")
+  cat("Tokens Used:", result$tokens$total,
+      "(prompt:", result$tokens$prompt, "+ completion:", result$tokens$completion, ")\n")
+  cat("Validation Passed:", result$validation_passed, "\n")
+  cat("Iterations:", result$iterations, "\n\n")
+
+  cat("--- LESSON TYPING ---\n")
+  cat("Stated Type:", analysis$lesson_typing$stated_type$stage %||% "N/A",
+      "/", analysis$lesson_typing$stated_type$sub_type %||% "N/A", "\n")
+  cat("Inferred Type:", analysis$lesson_typing$inferred_type$stage %||% "N/A",
+      "/", analysis$lesson_typing$inferred_type$sub_type %||% "N/A", "\n\n")
+
+  cat("--- ATOMIC LESSON ASSESSMENT ---\n")
+  cat("Is Single Atomic Lesson:", analysis$atomic_lesson_assessment$is_single_atomic_lesson, "\n")
+  cat("Number of Arcs:", length(analysis$atomic_lesson_assessment$arcs), "\n\n")
+
+  cat("--- RUBRIC SCORES (0-3) ---\n")
+  rubric <- analysis$rubric
+  cat("Template Fit:", rubric$template_fit$score, "\n")
+  cat("Structure Compliance:", rubric$template_structure_compliance$score, "\n")
+  cat("Cognitive Integrity:", rubric$cognitive_integrity$score, "\n")
+  cat("Boundary Discipline:", rubric$template_boundary_discipline$score, "\n")
+  cat("Progressive Model:", rubric$progressive_model_principle$score, "\n")
+  cat("Lesson Economy:", rubric$lesson_economy_and_cognitive_load$score, "\n\n")
+
+  cat("--- PRIORITY INDEX ---\n")
+  pi <- analysis$priority_index
+  cat("Priority Index:", pi$priority_index, "\n")
+  cat("Priority Band:", pi$priority_band, "\n")
+  cat("Base Sum:", pi$base_sum, "\n")
+  cat("Overload Factor:", pi$overload_factor, "\n\n")
+}
+```
+
+## 7. Example Usage
+
+```{r example_usage, eval=FALSE}
+# --- Single Lesson Analysis ---
+
+# Select a lesson ID to analyze
+example_lesson_id <- "2311"
+
+# Get lesson text (using functions from get_analysis_global.R)
+example_lesson_text <- get_updated_lesson_text(
+  selected_lesson_ids = example_lesson_id,
+  cached_lesson_text = cached_lesson_text,
+  content_tree = content_tree
+)
+
+# Run analysis
+single_result <- analyze_lesson_qualitative(
+  lesson_text = example_lesson_text$text[1],
+  lesson_id = example_lesson_id,
+  lesson_title = example_lesson_text$lesson[1]
+)
+
+# Save the result
+save_analysis_result(single_result)
+
+# View human-readable summary
+summarize_result(single_result)
+
+
+```
+
+```{r}
+
+# View just the analysis portion
+view_analysis(single_result)
+
+# View priority index details
+#single_result$analysis$priority_index
+
+# View rubric scores with reasons
+#single_result$analysis$rubric$template_fit
+```
+
+
+
+
+```{r}
+# Example: Analyze and inspect a lesson
+single_result
+```
+
+
+```{r}
+
+```
+
+---
+
+## Notes
+
+- This pipeline is designed as a black box function to be called from get_analysis_global.R
+- The main function is `analyze_lesson_qualitative()` which takes lesson text and returns structured analysis
+- Results are automatically validated against the schema with iterative feedback correction
+- Save results with `save_analysis_result()` for easy JSON inspection
+- Use `summarize_result()` to quickly view key metrics without opening the JSON file
+
+## Integration with get_analysis_global.R
+
+To use this pipeline from get_analysis_global.R, iterate through lessons and call:
+
+```r
+# In get_analysis_global.R:
+for (lesson_id in selected_lesson_ids) {
+  lesson_data <- get_updated_lesson_text(lesson_id, cached_lesson_text, content_tree)
+
+  result <- analyze_lesson_qualitative(
+    lesson_text = lesson_data$text[1],
+    lesson_id = lesson_id,
+    lesson_title = lesson_data$lesson[1]
+  )
+
+  save_analysis_result(result, output_dir = "qualitative_analysis_results")
+}
+```
+
+---
+
+## Removed Sections
+
+The following sections were removed as batch processing should be handled in get_analysis_global.R:
+- `analyze_lessons_batch()` function
+- `summarize_priority_indices()`, `summarize_rubric_scores()`, `summarize_lesson_typing()` functions
+
+These summary functions can be recreated in get_analysis_global.R by loading multiple saved JSON files if needed.
