@@ -18,7 +18,7 @@ server <- function(input, output, session) {
   .state$les_acc <- tibble::tibble()
   .state$analysis_cache <- analysis_cache
   .state$qualitative_enabled <- FALSE
-  .state$qual_results <- tibble::tibble(lesson_id = character(), qualitative_json = character())
+  .state$qual_results <- qualitative_cache
   # Reactive progress for UI display
   progress_info <- reactiveVal(list(done = 0L, total = 0L))
 
@@ -257,14 +257,28 @@ server <- function(input, output, session) {
     one_df <- NULL
     if (is.null(cached)) {
       # Pull single lesson only when cache is missing/stale
-      conn <- DBI::dbConnect(
-        RMariaDB::MariaDB(),
-        dbname   = 'learnable',
-        host     = '127.0.0.1',
-        port     = 2244,
-        user     = 'dbeaver',
-        password = 'shizkqhsh-18-791uwhsjw-891'
-      )
+      ensure_db_proxy()
+      conn <- tryCatch({
+        DBI::dbConnect(
+          RMariaDB::MariaDB(),
+          dbname   = 'learnable',
+          host     = '127.0.0.1',
+          port     = 2244,
+          user     = 'dbeaver',
+          password = 'shizkqhsh-18-791uwhsjw-891'
+        )
+      }, error = function(e) {
+        stop(
+          "\n\n========================================\n",
+          "DATABASE CONNECTION FAILED\n",
+          "========================================\n\n",
+          "Could not connect to the database.\n\n",
+          "The Cloud SQL proxy appears to be running, but the database connection failed.\n\n",
+          "Original error: ", conditionMessage(e), "\n",
+          "========================================\n",
+          call. = FALSE
+        )
+      })
       on.exit(DBI::dbDisconnect(conn), add = TRUE)
       q <- paste0(
         "SELECT CAST(l.id AS CHAR) AS lesson_id, d.content AS content ",
@@ -290,33 +304,64 @@ server <- function(input, output, session) {
 
       # Check if we already have a fresh SUCCESSFUL qualitative analysis for this lesson
       # Only successful analyses should be cached - failed ones should be retried
-      existing_qual <- .state$qual_results %>% dplyr::filter(lesson_id == lid)
+      # Get the LATEST successful analysis (regardless of model) within the 7-day window
+      existing_qual <- .state$qual_results %>%
+        dplyr::filter(lesson_id == lid)
+
       has_fresh_qual <- FALSE
       if (nrow(existing_qual) > 0 && "qa_analyzed_at" %in% names(existing_qual) && "qa_status" %in% names(existing_qual)) {
-        qa_status <- existing_qual$qa_status[[1]]
-        qa_timestamp <- existing_qual$qa_analyzed_at[[1]]
-        # Only use cache if status is "success" and timestamp is fresh
-        if (!is.null(qa_status) && !is.na(qa_status) && qa_status == "success" &&
-            !is.null(qa_timestamp) && !is.na(qa_timestamp) && qa_timestamp >= fresh_cutoff) {
+        # Filter to only successful analyses within the freshness window
+        fresh_successful <- existing_qual %>%
+          dplyr::filter(
+            qa_status == "success",
+            !is.na(qa_analyzed_at),
+            qa_analyzed_at >= fresh_cutoff
+          )
+
+        if (nrow(fresh_successful) > 0) {
+          # Get the most recent successful analysis
+          latest_analysis <- fresh_successful %>%
+            dplyr::arrange(dplyr::desc(qa_analyzed_at)) %>%
+            dplyr::slice(1)
+
           has_fresh_qual <- TRUE
+          qa_timestamp <- latest_analysis$qa_analyzed_at[[1]]
+          qa_model <- if ("qa_model" %in% names(latest_analysis)) latest_analysis$qa_model[[1]] else "unknown"
           message("  Using cached qualitative analysis for lesson ", lid, " (",
-                  round(as.numeric(difftime(now_ts, qa_timestamp, units = "days")), 1), " days old)")
-        } else if (!is.null(qa_status) && qa_status != "success") {
-          message("  Cached qualitative analysis for lesson ", lid, " has status '", qa_status, "' - retrying")
+                  round(as.numeric(difftime(now_ts, qa_timestamp, units = "days")), 1), " days old, model: ", qa_model, ")")
+        } else {
+          # Check if there are any analyses at all (even failed ones)
+          if (nrow(existing_qual) > 0) {
+            message("  Found ", nrow(existing_qual), " existing analysis/analyses for lesson ", lid, " but none are fresh and successful - running new analysis")
+          }
         }
       }
 
       if (!has_fresh_qual) {
         # Fetch content if we haven't already
         if (is.null(one_df)) {
-          conn <- DBI::dbConnect(
-            RMariaDB::MariaDB(),
-            dbname   = 'learnable',
-            host     = '127.0.0.1',
-            port     = 2244,
-            user     = 'dbeaver',
-            password = 'shizkqhsh-18-791uwhsjw-891'
-          )
+          ensure_db_proxy()
+          conn <- tryCatch({
+            DBI::dbConnect(
+              RMariaDB::MariaDB(),
+              dbname   = 'learnable',
+              host     = '127.0.0.1',
+              port     = 2244,
+              user     = 'dbeaver',
+              password = 'shizkqhsh-18-791uwhsjw-891'
+            )
+          }, error = function(e) {
+            stop(
+              "\n\n========================================\n",
+              "DATABASE CONNECTION FAILED\n",
+              "========================================\n\n",
+              "Could not connect to the database.\n\n",
+              "The Cloud SQL proxy appears to be running, but the database connection failed.\n\n",
+              "Original error: ", conditionMessage(e), "\n",
+              "========================================\n",
+              call. = FALSE
+            )
+          })
           on.exit(DBI::dbDisconnect(conn), add = TRUE)
           q <- paste0(
             "SELECT CAST(l.id AS CHAR) AS lesson_id, d.content AS content ",
@@ -328,11 +373,19 @@ server <- function(input, output, session) {
 
         lesson_text <- tryCatch({
           get_content_text(one_df$content[[1]])$content_text %||% ""
-        }, error = function(e) "")
+        }, error = function(e) {
+          message("ERROR extracting lesson text: ", e$message)
+          ""
+        })
+
+        message("DEBUG: Lesson text length for ", lid, ": ", nchar(lesson_text), " characters")
+
         if (nchar(lesson_text) >= 100) {
           # Get selected model from UI, default to gpt-5.1
           selected_model <- tryCatch(input$qualitativeModel, error = function(e) "gpt-5.1")
           if (is.null(selected_model) || selected_model == "") selected_model <- "gpt-5.1"
+
+          message("DEBUG: About to call analyze_lesson_qualitative for lesson ", lid, " with model ", selected_model)
 
           # Try to analyze, but continue on error
           qres <- tryCatch({
@@ -372,26 +425,29 @@ server <- function(input, output, session) {
         # Add status column
         status <- if (!is.null(qres$error)) "failed" else if (isTRUE(qres$validation_passed)) "success" else "validation_failed"
 
-        # Store qualitative results with timestamp
+        # Store qualitative results with timestamp and model
+        # Keep ALL historical analyses for longitudinal studies and model comparisons
         qual_row <- tibble::tibble(
           lesson_id = lid,
           qualitative_json = as.character(qjson),
           qa_status = status,
           qa_error = qres$error %||% NA_character_,
-          qa_analyzed_at = now_ts
+          qa_analyzed_at = now_ts,
+          qa_model = selected_model
         ) %>%
           dplyr::bind_cols(scores_df)
 
-        # Remove any existing result for this lesson_id before adding the new one
-        # This ensures retries overwrite old results
-        .state$qual_results <- .state$qual_results %>%
-          dplyr::filter(lesson_id != lid)
-
+        # Add new result WITHOUT removing old ones - preserve all historical analyses
         .state$qual_results <- dplyr::bind_rows(
           .state$qual_results,
           qual_row
         )
-      }
+
+        # Save qualitative cache to disk
+        saveRDS(.state$qual_results, qualitative_cache_file)
+        } else {
+          message("DEBUG: Lesson text too short (", nchar(lesson_text), " chars) - skipping qualitative analysis for lesson ", lid)
+        }
       }
     }
     # Backward compatibility: ensure heading-by-level columns exist on section table (cached rows may lack them)
@@ -436,9 +492,21 @@ server <- function(input, output, session) {
         by = "lesson_id"
       ) %>%
       dplyr::relocate(lesson, .after = lesson_id) %>%
-      dplyr::arrange(lesson_id) %>%
-      # Join qualitative results (lesson-level data)
-      dplyr::left_join(.state$qual_results, by = "lesson_id")
+      dplyr::arrange(lesson_id)
+
+    # Join qualitative results (lesson-level data)
+    # Get only the LATEST analysis per lesson for display
+    # (All historical analyses are preserved in .state$qual_results for data warehouse export)
+    if (nrow(.state$qual_results) > 0) {
+      latest_qual <- .state$qual_results %>%
+        dplyr::group_by(lesson_id) %>%
+        dplyr::arrange(dplyr::desc(qa_analyzed_at)) %>%
+        dplyr::slice(1) %>%
+        dplyr::ungroup()
+
+      les_acc <- les_acc %>%
+        dplyr::left_join(latest_qual, by = "lesson_id")
+    }
     .state$les_acc <- les_acc
     lesson_metrics_acc(.state$les_acc)
 
@@ -2123,13 +2191,12 @@ server <- function(input, output, session) {
       if (!is.null(analysis$lesson_typing)) {
         lt <- analysis$lesson_typing
         typing_text <- paste0(
-          "Stated Type: ", lt$stated_type$stage %||% "N/A", " / ", lt$stated_type$sub_type %||% "N/A", "\n",
           "Inferred Type: ", lt$inferred_type$stage %||% "N/A", " / ", lt$inferred_type$sub_type %||% "N/A", "\n",
           "Justification: ", lt$typing_justification %||% "N/A"
         )
         content_parts[[length(content_parts) + 1]] <- tagList(
           tags$h4("Lesson Typing"),
-          tags$pre(typing_text)
+          tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", typing_text)
         )
       }
 
@@ -2147,7 +2214,7 @@ server <- function(input, output, session) {
         )
         content_parts[[length(content_parts) + 1]] <- tagList(
           tags$h4("Rubric Scores"),
-          tags$pre(rubric_text)
+          tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", rubric_text)
         )
       }
 
@@ -2164,7 +2231,7 @@ server <- function(input, output, session) {
         )
         content_parts[[length(content_parts) + 1]] <- tagList(
           tags$h4("Priority Index"),
-          tags$pre(priority_text)
+          tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", priority_text)
         )
       }
 
@@ -2177,7 +2244,7 @@ server <- function(input, output, session) {
         )
         content_parts[[length(content_parts) + 1]] <- tagList(
           tags$h4("Atomic Lesson Assessment"),
-          tags$pre(atomic_text)
+          tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", atomic_text)
         )
       }
 
@@ -2204,7 +2271,7 @@ server <- function(input, output, session) {
 
       content_parts[[length(content_parts) + 1]] <- tagList(
         tags$h4("Analysis Metadata"),
-        tags$pre(meta_text)
+        tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", meta_text)
       )
     }
 
@@ -2213,7 +2280,7 @@ server <- function(input, output, session) {
       tagList(
         if (length(content_parts) > 0) content_parts else tags$em("No analysis data available."),
         tags$hr(),
-        tags$details(tags$summary("Raw JSON"), tags$pre(qjson))
+        tags$details(tags$summary("Raw JSON"), tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", qjson))
       ),
       easyClose = TRUE,
       size = "l"

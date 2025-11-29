@@ -44,6 +44,30 @@ ggside_available <- requireNamespace("ggside", quietly = TRUE)
 
 #initialisation
 
+# Load environment variables from .env file
+env_file <- file.path(getwd(), ".env")
+if (file.exists(env_file)) {
+  env_vars <- readLines(env_file, warn = FALSE)
+  for (line in env_vars) {
+    line <- trimws(line)
+    # Skip empty lines and comments
+    if (nchar(line) == 0 || startsWith(line, "#")) next
+    # Parse KEY=VALUE format
+    if (grepl("=", line)) {
+      parts <- strsplit(line, "=", fixed = TRUE)[[1]]
+      if (length(parts) >= 2) {
+        key <- trimws(parts[1])
+        value <- trimws(paste(parts[-1], collapse = "="))
+        # Set environment variable using proper syntax
+        do.call(Sys.setenv, setNames(list(value), key))
+      }
+    }
+  }
+  message("✓ Loaded environment variables from .env file")
+} else {
+  message("Note: .env file not found - qualitative analysis may fail without OPENAI_API_KEY")
+}
+
 # App configuration and cache setup
 # Get today's date in the format used in filenames
 today_string <- format(Sys.Date(), "%Y-%m-%d")
@@ -54,23 +78,104 @@ cache_path <- "cache"
 content_tree_file <- file.path(cache_path, paste0("content_tree_", today_string, ".rds"))
 lesson_text_file <- file.path(cache_path, paste0("lesson_text_app-", today_string, ".rds"))
 analysis_cache_file <- file.path(cache_path, "analysis_cache.rds")
+qualitative_cache_file <- file.path(cache_path, "qualitative_cache.rds")
 
+
+# Helper function to ensure Cloud SQL proxy is running
+ensure_db_proxy <- function() {
+  # Check if we can connect to the database port
+  can_connect <- tryCatch({
+    con <- socketConnection(host = "127.0.0.1", port = 2244, open = "r+", timeout = 1)
+    close(con)
+    TRUE
+  }, error = function(e) FALSE)
+
+  if (!can_connect) {
+    message("Cloud SQL proxy not detected. Starting it now...")
+
+    # Path to the proxy script
+    proxy_script <- file.path(getwd(), "learnable-staging-db")
+
+    if (!file.exists(proxy_script)) {
+      stop(
+        "\n\n========================================\n",
+        "CLOUD SQL PROXY SCRIPT NOT FOUND\n",
+        "========================================\n\n",
+        "Could not find the proxy script at: ", proxy_script, "\n\n",
+        "Please ensure 'learnable-staging-db' exists in the project directory.\n",
+        "========================================\n",
+        call. = FALSE
+      )
+    }
+
+    # Make the script executable
+    system2("chmod", args = c("+x", proxy_script), stdout = FALSE, stderr = FALSE)
+
+    # Start the proxy in the background
+    system2(proxy_script, wait = FALSE, stdout = FALSE, stderr = FALSE)
+
+    # Wait a moment for the proxy to start
+    message("Waiting for Cloud SQL proxy to start...")
+    Sys.sleep(3)
+
+    # Verify it's now running
+    can_connect_now <- tryCatch({
+      con <- socketConnection(host = "127.0.0.1", port = 2244, open = "r+", timeout = 2)
+      close(con)
+      TRUE
+    }, error = function(e) FALSE)
+
+    if (!can_connect_now) {
+      stop(
+        "\n\n========================================\n",
+        "FAILED TO START CLOUD SQL PROXY\n",
+        "========================================\n\n",
+        "The proxy script was executed but the connection still failed.\n\n",
+        "Please try running manually:\n",
+        "  ./learnable-staging-db\n\n",
+        "And check for any error messages.\n",
+        "========================================\n",
+        call. = FALSE
+      )
+    }
+
+    message("✓ Cloud SQL proxy started successfully!")
+  } else {
+    message("✓ Cloud SQL proxy is already running")
+  }
+}
 
 #function that retrieves the content structure from the Learnable database
 get_content_tree <- function() {
+  # Ensure Cloud SQL proxy is running
+  ensure_db_proxy()
+
   # Connect to the MariaDB (MySQL-compatible) database
-  connection <- dbConnect(
-    RMariaDB::MariaDB(),
-    dbname   = 'learnable',
-    host     = '127.0.0.1',
-    port     = 2244,
-    user     = 'dbeaver',
-    password = 'shizkqhsh-18-791uwhsjw-891'
-  )
-  
+  connection <- tryCatch({
+    dbConnect(
+      RMariaDB::MariaDB(),
+      dbname   = 'learnable',
+      host     = '127.0.0.1',
+      port     = 2244,
+      user     = 'dbeaver',
+      password = 'shizkqhsh-18-791uwhsjw-891'
+    )
+  }, error = function(e) {
+    stop(
+      "\n\n========================================\n",
+      "DATABASE CONNECTION FAILED\n",
+      "========================================\n\n",
+      "Could not connect to the database.\n\n",
+      "The Cloud SQL proxy appears to be running, but the database connection failed.\n\n",
+      "Original error: ", conditionMessage(e), "\n",
+      "========================================\n",
+      call. = FALSE
+    )
+  })
+
   # Query content hierarchy; filter to Module-level nodes to match app scope
   query <- paste0("\n    SELECT\n      l.id                 AS lesson_id,\n      tn.position          AS level_1_pos,\n      tn.structure_title   AS level_1_title,\n      tn2.position         AS level_2_pos,\n      tn2.structure_title  AS level_2_title,\n      tn3.position         AS level_3_pos,\n      tn3.structure_title  AS level_3_title,\n      tn4.position         AS level_4_pos,\n      tn4.structure_title  AS level_4_title\n    FROM collections c\n    JOIN tree_nodes tn   ON c.root_tree_node_id = tn.id\n    JOIN tree_nodes tn2  ON tn2.parent_id = tn.id\n    JOIN tree_nodes tn3  ON tn3.parent_id = tn2.id\n    JOIN tree_nodes tn4  ON tn4.parent_id = tn3.id\n    JOIN lesson_tree_node ltn ON tn4.id = ltn.tree_node_id\n    JOIN lessons l       ON l.id = ltn.lesson_id\n    where tn2.structure_title like 'Module%'\n    ;\n  ")
-  
+
   content_index <- dbGetQuery(connection, query)
   dbDisconnect(connection)
   return(content_index)
@@ -149,6 +254,13 @@ analysis_cache <- if (file.exists(analysis_cache_file)) {
   tibble::tibble()
 }
 
+# Qualitative analysis cache: lesson-level qualitative results with freshness timestamp
+qualitative_cache <- if (file.exists(qualitative_cache_file)) {
+  readRDS(qualitative_cache_file)
+} else {
+  tibble::tibble(lesson_id = character(), qualitative_json = character())
+}
+
 
 # Initialise variable
 lesson_text <- NULL
@@ -167,19 +279,35 @@ get_content_df <- function(filtered_content_index) {
   if (length(ids) == 0) {
     return(tibble(lesson_id = character(), content = character()))
   }
-  
-  connection <- dbConnect(
-    RMariaDB::MariaDB(),
-    dbname   = 'learnable',
-    host     = '127.0.0.1',
-    port     = 2244,
-    user     = 'dbeaver',
-    password = 'shizkqhsh-18-791uwhsjw-891'
-  )
-  
+
+  # Ensure Cloud SQL proxy is running
+  ensure_db_proxy()
+
+  connection <- tryCatch({
+    dbConnect(
+      RMariaDB::MariaDB(),
+      dbname   = 'learnable',
+      host     = '127.0.0.1',
+      port     = 2244,
+      user     = 'dbeaver',
+      password = 'shizkqhsh-18-791uwhsjw-891'
+    )
+  }, error = function(e) {
+    stop(
+      "\n\n========================================\n",
+      "DATABASE CONNECTION FAILED\n",
+      "========================================\n\n",
+      "Could not connect to the database.\n\n",
+      "The Cloud SQL proxy appears to be running, but the database connection failed.\n\n",
+      "Original error: ", conditionMessage(e), "\n",
+      "========================================\n",
+      call. = FALSE
+    )
+  })
+
   # Safely quote IDs
   ids_sql <- paste(DBI::dbQuoteString(connection, ids), collapse = ",")
-  
+
   query <- paste0("
     SELECT
       CAST(l.id AS CHAR) AS lesson_id,
@@ -188,11 +316,11 @@ get_content_df <- function(filtered_content_index) {
     JOIN docs d ON l.doc_id = d.id
     WHERE l.id IN (", ids_sql, ");
   ")
-  
+
   df <- dbGetQuery(connection, query) %>%
     as_tibble() %>%
     rename(content = content_json)
-  
+
   dbDisconnect(connection)
   df
 }
