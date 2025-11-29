@@ -478,6 +478,10 @@ server <- function(input, output, session) {
         headings_h6 = sum(headings_h6, na.rm = TRUE),
         nodes_native = sum(nodes_native, na.rm = TRUE),
         nodes_custom = sum(nodes_custom, na.rm = TRUE),
+        cc_stacks_total = sum(cc_stacks_total, na.rm = TRUE),
+        cc_stacks_single = sum(cc_stacks_single, na.rm = TRUE),
+        cc_stacks_multi = sum(cc_stacks_multi, na.rm = TRUE),
+        cc_questions_total = sum(cc_questions_total, na.rm = TRUE),
         images_count = sum(images_count, na.rm = TRUE),
         tables_count = sum(tables_count, na.rm = TRUE),
         lists_count = sum(lists_count, na.rm = TRUE),
@@ -884,23 +888,66 @@ server <- function(input, output, session) {
         showlegend = TRUE
       )
     } else {
+      # Create binned histogram data for selection
+      nbins <- 20
+      bin_width <- (xr[2] - 0) / nbins
+
+      # Get selected labels for highlighting bins
+      sel_labels <- lesson_highlights()
+
       top <- plotly::plot_ly()
       for (g in groups) {
         sub <- df[df$grp %in% g | (!"grp" %in% names(df)), , drop = FALSE]
-        top <- top %>% plotly::add_trace(x = sub$value, type = "histogram", nbinsx = 20, name = g,
-                                         marker = list(color = unname(pal[g]), line = list(color = "black", width = 0.5)),
-                                         opacity = 0.6, hoverinfo = "skip", showlegend = TRUE)
-        if (nrow(sub)) {
+
+        if (nrow(sub) > 0) {
+          # Create bins and assign each value to a bin
+          sub$bin <- cut(sub$value, breaks = seq(0, xr[2], by = bin_width),
+                        include.lowest = TRUE, right = FALSE)
+
+          # Count items per bin and collect node IDs for each bin
+          bin_counts <- sub %>%
+            dplyr::group_by(bin) %>%
+            dplyr::summarise(
+              count = dplyr::n(),
+              bin_start = min(as.numeric(gsub("\\[|\\(|,.*", "", as.character(bin)))),
+              nodes = list(as.character(node)),
+              .groups = "drop"
+            )
+
+          # Create unique bin IDs for each bin (group_binindex)
+          bin_counts$bin_id <- paste0(g, "_bin", seq_len(nrow(bin_counts)))
+
+          # Determine color for each bin - black if any nodes in the bin are selected
+          bin_colors <- sapply(bin_counts$nodes, function(nodes_in_bin) {
+            if (length(sel_labels) > 0 && any(nodes_in_bin %in% sel_labels)) {
+              "black"
+            } else {
+              unname(pal[g])
+            }
+          })
+
+          # Create bar trace with all nodes in the bin as the key (for selection)
           top <- top %>% plotly::add_trace(
-            x = sub$value, y = stats::runif(nrow(sub), -0.05, 0.05),
-            type = "scatter", mode = "markers", name = paste0(g, " (select)"),
-            key = sub$node, showlegend = FALSE, hoverinfo = "skip",
-            marker = list(size = 14, color = "rgba(0,0,0,0.01)")
+            x = bin_counts$bin_start + bin_width/2,
+            y = bin_counts$count,
+            type = "bar",
+            width = bin_width * 0.9,
+            name = g,
+            key = bin_counts$bin_id,
+            marker = list(color = bin_colors, line = list(color = "black", width = 0.5)),
+            opacity = 0.6,
+            customdata = bin_counts$nodes,
+            hovertemplate = paste0(g, "<br>Count: %{y}<extra></extra>"),
+            showlegend = TRUE
           )
         }
       }
-      top <- top %>% plotly::layout(yaxis = list(visible = FALSE), xaxis = list(range = c(0, xr[2])),
-                                    barmode = "overlay", showlegend = TRUE)
+      top <- top %>% plotly::layout(
+        yaxis = list(title = "Count"),
+        xaxis = list(range = c(0, xr[2])),
+        barmode = "overlay",
+        showlegend = TRUE
+      )
     }
     # Order bars by node order in the tree for the selected aggregation level
     lvl_for_order <- input$aggLevel %||% "lesson"
@@ -913,6 +960,8 @@ server <- function(input, output, session) {
     level_nodes <- tree_order[tree_order %in% as.character(df$node)]
     # Fallback to current order if empty for any reason
     if (!length(level_nodes)) level_nodes <- unique(as.character(df$node))
+    # Reverse the order so bars appear bottom-to-top in natural reading order
+    level_nodes <- rev(level_nodes)
     df$node <- factor(df$node, levels = level_nodes)
     bar_colors <- if ("grp" %in% names(df)) pal[as.character(df$grp)] else rep("#D1C8F1", nrow(df))
     bar_colors[is.na(bar_colors)] <- "#D1C8F1"
@@ -1009,8 +1058,15 @@ server <- function(input, output, session) {
       click_ev <- safe_event_data('plotly_click', 'lessonBars')
       if (!is.null(sel_ev) && NROW(sel_ev)) {
         sel_labels <- unique(as.character(sel_ev$y))
-      } else if (!is.null(click_ev) && !is.null(click_ev$y)) {
-        sel_labels <- as.character(click_ev$y[1])
+      } else if (!is.null(click_ev)) {
+        # Check if this is a histogram bin click (has customdata with list of nodes)
+        if (!is.null(click_ev$customdata) && length(click_ev$customdata) > 0) {
+          # Histogram bin click - select all nodes in the bin
+          sel_labels <- unlist(click_ev$customdata[[1]])
+        } else if (!is.null(click_ev$y)) {
+          # Regular bar click
+          sel_labels <- as.character(click_ev$y[1])
+        }
       } else {
         row <- input$lessonMetricsTable_rows_selected
         if (!is.null(row) && length(row) == 1 && row >= 1 && row <= nrow(df)) sel_labels <- df$node[row]
@@ -1378,34 +1434,77 @@ server <- function(input, output, session) {
     ev <- safe_event_data("plotly_click", "lessonBars")
     sel <- safe_event_data("plotly_selected", "lessonBars")
     if (!is.null(sel) && NROW(sel)) {
-      labs <- if (!is.null(sel$key)) unique(as.character(sel$key)) else unique(as.character(sel$y))
-      sig <- paste0("S|", paste(sort(labs), collapse = "|"))
-      if (!identical(sig, ev_sigs$lesson_sel)) {
-        ev_sigs$lesson_sel <- sig
-        cur <- isolate(selected_members())
-        new_sel <- sort(unique(c(cur, labs)))
-        if (!setequal(new_sel, cur)) {
-          selected_members(new_sel)
-          lesson_filter(list(type = "labels", values = new_sel))
+      labs <- NULL
+      # Check if this is histogram bin selection (has customdata with list of nodes)
+      if (!is.null(sel$customdata) && length(sel$customdata) > 0) {
+        # Extract all nodes from all selected bins
+        # customdata can be a list of lists, flatten all node vectors
+        all_nodes <- lapply(seq_len(length(sel$customdata)), function(i) {
+          cd <- sel$customdata[[i]]
+          if (is.list(cd)) {
+            # cd is a list containing the nodes vector
+            unlist(cd)
+          } else if (is.character(cd)) {
+            # cd is already a character vector
+            cd
+          } else {
+            character(0)
+          }
+        })
+        labs <- unique(unlist(all_nodes))
+      } else if (!is.null(sel$key)) {
+        labs <- unique(as.character(sel$key))
+      } else if (!is.null(sel$y)) {
+        labs <- unique(as.character(sel$y))
+      }
+
+      if (!is.null(labs) && length(labs) > 0) {
+        sig <- paste0("S|", paste(sort(labs), collapse = "|"))
+        if (!identical(sig, ev_sigs$lesson_sel)) {
+          ev_sigs$lesson_sel <- sig
+          # For box selection, replace the selection (don't union with current)
+          new_sel <- sort(unique(labs))
+          if (!setequal(new_sel, selected_members())) {
+            selected_members(new_sel)
+            lesson_filter(list(type = "labels", values = new_sel))
+          }
         }
       }
       return()
     }
     if (!is.null(ev)) {
-      lab <- NULL
-      if (!is.null(ev$key)) {
-        lab <- as.character(ev$key)[1]
+      labs <- NULL
+      # Check if this is a histogram bin click (has customdata with list of nodes)
+      if (!is.null(ev$customdata) && length(ev$customdata) > 0) {
+        # Histogram bin click - select all nodes in the bin
+        labs <- unlist(ev$customdata[[1]])
+      } else if (!is.null(ev$key)) {
+        labs <- as.character(ev$key)[1]
       } else if (!is.null(ev$y)) {
-        lab <- as.character(ev$y)[1]
+        labs <- as.character(ev$y)[1]
       }
-      if (!is.null(lab) && nchar(lab)) {
-        sig <- paste0("C|", lab)
+      if (!is.null(labs) && length(labs) > 0) {
+        sig <- paste0("C|", paste(sort(labs), collapse = "|"))
         if (!identical(sig, ev_sigs$lesson_clk)) {
           ev_sigs$lesson_clk <- sig
           cur <- isolate(selected_members())
-          if (lab %in% cur) cur <- setdiff(cur, lab) else cur <- sort(unique(c(cur, lab)))
-          selected_members(cur)
-          lesson_filter(list(type = "labels", values = cur))
+          # For bin clicks (multiple labels), replace selection
+          # For single bar clicks, toggle selection
+          if (length(labs) > 1) {
+            # Bin click - replace selection with all nodes in bin
+            new_sel <- sort(unique(labs))
+          } else {
+            # Single bar click - toggle
+            if (labs %in% cur) {
+              new_sel <- setdiff(cur, labs)
+            } else {
+              new_sel <- sort(unique(c(cur, labs)))
+            }
+          }
+          if (!setequal(new_sel, cur)) {
+            selected_members(new_sel)
+            lesson_filter(list(type = "labels", values = new_sel))
+          }
         }
       }
     }
@@ -1543,7 +1642,8 @@ server <- function(input, output, session) {
       "words_total","words_nomath","chars_total","sentences_nomath",
       "blocks_total","words_sum","headings_count","headings_h1","headings_h2","headings_h3","headings_h6","images_count",
       "tables_count","lists_count","latex_total","latex_inline",
-      "latex_display","latex_display_multi","nodes_native","nodes_custom"
+      "latex_display","latex_display_multi","nodes_native","nodes_custom",
+      "cc_stacks_total","cc_stacks_single","cc_stacks_multi","cc_questions_total"
     )
     ok <- intersect(candidates, names(df))
     if (length(ok) == 0) return()
@@ -1726,6 +1826,12 @@ server <- function(input, output, session) {
         metric = isolate(input$lessonMetric) %||% pd$metric_name,
         value = .data$value
       )
+
+    # Filter table to selected members only (if any are selected)
+    sel_members <- selected_members()
+    if (length(sel_members) > 0) {
+      tbl <- tbl %>% dplyr::filter(node %in% sel_members)
+    }
 
     DT::datatable(
       tbl,

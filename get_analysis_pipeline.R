@@ -222,66 +222,43 @@ count_nodes_native_custom <- function(node) {
 
 # Count concept-check stacks and questions (recursive)
 count_concept_checks <- function(node) {
-  # Normalize any data.frame-based nodes to list form to ensure uniform traversal
-  normalize_node <- function(n) {
-    if (is.null(n)) return(n)
-    # If the node itself or its content is a data.frame, round-trip via JSON to coerce to lists
-    if (is.data.frame(n) || (!is.null(n$content) && is.data.frame(n$content))) {
-      jsonlite::fromJSON(jsonlite::toJSON(n, auto_unbox = TRUE, null = "null", digits = NA), simplifyVector = FALSE)
-    } else {
-      n
-    }
+  # In rowwise context, node might be wrapped in a list - unwrap it
+  if (is.list(node) && length(node) == 1 && is.null(names(node)) && is.list(node[[1]]) && !is.null(node[[1]]$type)) {
+    node <- node[[1]]
   }
-  node <- normalize_node(node)
 
   totals <- list(stacks = 0L, single = 0L, multi = 0L, questions = 0L)
   walk <- function(n) {
     if (is.null(n)) return()
-    n <- normalize_node(n)
-    # Direct match
-    if (is.list(n) && !is.null(n$type)) {
-      t <- tryCatch(as.character(n$type), error = function(e) NA_character_)
-      # Accept common variants of the node name
-      is_cc <- isTRUE(!is.na(t)) && (
-        identical(t, "concept-check-stack") ||
-        grepl("^concept[-_]?check[-_]?stack$", t, ignore.case = TRUE)
-      )
-      if (is_cc) {
+    # Check if this node is a concept-check-stack
+    if (is.list(n) && !is.null(n$type) && identical(n$type, "concept-check-stack")) {
       totals$stacks <<- totals$stacks + 1L
-      qids <- tryCatch(n$attrs$questionIds, error = function(e) NULL)
-      qlen <- 0L
-      if (!is.null(qids)) {
-        qlen <- suppressWarnings(tryCatch(length(qids), error = function(e) 0L))
-        if (!is.finite(qlen)) qlen <- 0L
+      # Extract questionIds from attrs
+      qids <- NULL
+      if (!is.null(n$attrs) && !is.null(n$attrs$questionIds)) {
+        qids <- n$attrs$questionIds
       }
-      totals$questions <<- totals$questions + as.integer(qlen)
-      if (qlen <= 1L) totals$single <<- totals$single + 1L else totals$multi <<- totals$multi + 1L
-      }
-    }
-    # Recurse common child containers
-    if (!is.null(n$content)) {
-      if (is.list(n$content)) purrr::walk(n$content, walk)
-      if (is.data.frame(n$content)) {
-        # iterate rows as list-like
-        for (i in seq_len(nrow(n$content))) {
-          walk(normalize_node(n$content[i, , drop = FALSE]))
-        }
+      qlen <- if (!is.null(qids)) length(qids) else 0L
+      totals$questions <<- totals$questions + qlen
+      if (qlen <= 1L) {
+        totals$single <<- totals$single + 1L
+      } else {
+        totals$multi <<- totals$multi + 1L
       }
     }
-    if (!is.null(n$children)) {
-      if (is.list(n$children)) purrr::walk(n$children, walk)
-      if (is.data.frame(n$children)) {
-        for (i in seq_len(nrow(n$children))) {
-          walk(normalize_node(n$children[i, , drop = FALSE]))
-        }
-      }
+    # Recurse into content
+    if (is.list(n$content)) {
+      purrr::walk(n$content, walk)
     }
-    # Also iterate through any nested list elements (e.g., marks, attrs lists)
+    # Also iterate over list elements if this is a typeless list
     if (is.list(n) && is.null(n$type)) {
-      for (el in n) if (is.list(el) || is.data.frame(el)) walk(el)
+      for (el in n) {
+        if (is.list(el)) walk(el)
+      }
     }
   }
   walk(node)
+
   tibble::tibble(
     cc_stacks_total = totals$stacks,
     cc_stacks_single = totals$single,
