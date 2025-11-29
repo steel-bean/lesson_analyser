@@ -17,14 +17,25 @@ ui <- fluidPage(
       width = 8,
       tags$div(
         style = "margin-bottom: 12px; display: flex; align-items: center; gap: 12px;",
-        actionButton("pullContent", "Analyse content"),
-        checkboxInput("qualitativeEnabled", "Qualtitative Analysis", value = FALSE),
-        selectInput("qualitativeModel", "Model",
-          choices = c("gpt-5.1", "gpt-5.1-2025-11-13", "gpt-5.1-chat-latest", "gpt-5-mini", "gpt-4o", "gpt-4.1", "gpt-4o-mini"),
-          selected = "gpt-5.1",
-          width = "200px"
+        actionButton("pullContent", "Analyse content", style = "margin-top: 7px;"),
+        tags$div(
+          style = "margin-top: 0;",
+          shinyWidgets::pickerInput("qualitativeModel", "Select model for qualitative analysis",
+            choices = list(
+              "Do not perform qualitative analysis" = "",
+              "gpt-5.1" = "gpt-5.1",
+              "gpt-5-mini" = "gpt-5-mini"
+              # "gpt-5.1-2025-11-13" = "gpt-5.1-2025-11-13",
+              # "gpt-5.1-chat-latest" = "gpt-5.1-chat-latest",
+              # "gpt-4o" = "gpt-4o",
+              # "gpt-4.1" = "gpt-4.1",
+              # "gpt-4o-mini" = "gpt-4o-mini"
+            ),
+            selected = "",
+            width = "320px"
+          )
         ),
-        tags$span(textOutput("analysisProgress", inline = TRUE), style = "color:#666;")
+        tags$span(textOutput("analysisProgress", inline = TRUE), style = "color:#666; margin-top: 7px;")
       ),
       tabsetPanel(
         id = "mainTabs",

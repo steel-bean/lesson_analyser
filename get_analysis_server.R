@@ -18,6 +18,31 @@ server <- function(input, output, session) {
   .state$les_acc <- tibble::tibble()
   .state$analysis_cache <- analysis_cache
   .state$qualitative_enabled <- FALSE
+
+  # Backward compatibility: ensure qa_model column exists in cached data
+  if (nrow(qualitative_cache) > 0 && !"qa_model" %in% names(qualitative_cache)) {
+    message("Backward compatibility: Adding qa_model column to cached qualitative data")
+    # Extract model from each JSON entry
+    qualitative_cache$qa_model <- sapply(qualitative_cache$qualitative_json, function(qjson) {
+      if (is.na(qjson) || qjson == "") return(NA_character_)
+      x <- tryCatch(jsonlite::fromJSON(qjson, simplifyVector = FALSE), error = function(e) NULL)
+      if (is.null(x)) return(NA_character_)
+      x$model %||% NA_character_
+    })
+  }
+
+  # Clean up any duplicate qa_model columns from previous schema changes
+  if (nrow(qualitative_cache) > 0) {
+    col_names <- names(qualitative_cache)
+    if (any(grepl("^qa_model\\.\\.\\.\\d+$", col_names))) {
+      message("Cleaning up duplicate qa_model columns in cache")
+      qa_model_cols <- grepl("^qa_model", col_names)
+      first_qa_model_idx <- which(qa_model_cols)[1]
+      cols_to_keep <- !qa_model_cols | seq_along(col_names) == first_qa_model_idx
+      qualitative_cache <- qualitative_cache[, cols_to_keep]
+    }
+  }
+
   .state$qual_results <- qualitative_cache
   # Reactive progress for UI display
   progress_info <- reactiveVal(list(done = 0L, total = 0L))
@@ -31,15 +56,11 @@ server <- function(input, output, session) {
       qa_template_boundary_discipline = NA_real_,
       qa_progressive_model_principle = NA_real_,
       qa_lesson_economy_and_cognitive_load = NA_real_,
-      qa_priority_index = NA_real_,
-      qa_model = NA_character_
+      qa_priority_index = NA_real_
     )
     if (is.null(qjson) || is.na(qjson) || identical(qjson, "")) return(as.data.frame(cols))
     x <- tryCatch(jsonlite::fromJSON(qjson, simplifyVector = FALSE), error = function(e) NULL)
     if (is.null(x)) return(as.data.frame(cols))
-
-    # Extract model even if analysis is NULL (for error cases)
-    cols$qa_model <- x$model %||% NA_character_
 
     # Return early if no analysis (error case)
     if (is.null(x$analysis)) return(as.data.frame(cols))
@@ -378,14 +399,12 @@ server <- function(input, output, session) {
           ""
         })
 
-        message("DEBUG: Lesson text length for ", lid, ": ", nchar(lesson_text), " characters")
-
         if (nchar(lesson_text) >= 100) {
-          # Get selected model from UI, default to gpt-5.1
-          selected_model <- tryCatch(input$qualitativeModel, error = function(e) "gpt-5.1")
-          if (is.null(selected_model) || selected_model == "") selected_model <- "gpt-5.1"
-
-          message("DEBUG: About to call analyze_lesson_qualitative for lesson ", lid, " with model ", selected_model)
+          # Get selected model from state (captured at button click time)
+          selected_model <- .state$selected_model
+          if (is.null(selected_model) || selected_model == "") {
+            selected_model <- "gpt-5.1"
+          }
 
           # Try to analyze, but continue on error
           qres <- tryCatch({
@@ -442,6 +461,16 @@ server <- function(input, output, session) {
           .state$qual_results,
           qual_row
         )
+
+        # Remove any duplicate qa_model columns (can happen after schema changes)
+        col_names <- names(.state$qual_results)
+        if (any(grepl("^qa_model\\.\\.\\.\\d+$", col_names))) {
+          # Keep only the first qa_model column
+          qa_model_cols <- grepl("^qa_model", col_names)
+          first_qa_model_idx <- which(qa_model_cols)[1]
+          cols_to_keep <- !qa_model_cols | seq_along(col_names) == first_qa_model_idx
+          .state$qual_results <- .state$qual_results[, cols_to_keep]
+        }
 
         # Save qualitative cache to disk
         saveRDS(.state$qual_results, qualitative_cache_file)
@@ -530,7 +559,11 @@ server <- function(input, output, session) {
     # Reset accumulators and progress and ids
     section_metrics_acc(tibble::tibble())
     lesson_metrics_acc(tibble::tibble())
-    .state$qualitative_enabled <- isTRUE(input$qualitativeEnabled)
+    # Capture the selected model at button click time so it's available in async processing
+    selected_model <- input$qualitativeModel
+    .state$selected_model <- if (!is.null(selected_model) && nchar(selected_model) > 0) selected_model else NULL
+    # Check if qualitative analysis is enabled based on model selection
+    .state$qualitative_enabled <- !is.null(.state$selected_model)
     # DO NOT reset qual_results - we want to preserve the cache between runs
     # .state$qual_results is only initialized once at startup and persists
     .state$ids <- ids
@@ -945,7 +978,7 @@ server <- function(input, output, session) {
       top <- top %>% plotly::layout(
         yaxis = list(title = "Count"),
         xaxis = list(range = c(0, xr[2])),
-        barmode = "overlay",
+        barmode = "stack",
         showlegend = TRUE
       )
     }

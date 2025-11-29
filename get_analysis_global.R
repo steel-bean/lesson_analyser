@@ -230,6 +230,12 @@ if (file.exists(content_tree_file)) {
   content_tree <- tryCatch({
     result <- get_content_tree()
     message("✓ Successfully fetched content tree from database. Saving to cache...")
+    # Delete old content_tree_*.rds files before saving the new one
+    old_files <- list.files(cache_path, pattern = "^content_tree_.*\\.rds$", full.names = TRUE)
+    if (length(old_files) > 0) {
+      message("  Deleting ", length(old_files), " old content_tree file(s)...")
+      file.remove(old_files)
+    }
     saveRDS(result, content_tree_file)
     process_content_tree(result)
   }, error = function(e) {
