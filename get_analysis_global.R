@@ -224,14 +224,37 @@ if (file.exists(content_tree_file)) {
   message("Loading content tree from cache.")
   content_tree <- readRDS(content_tree_file) %>%
     process_content_tree()
-  
+
 } else {
-  content_tree <- get_content_tree() 
-  message("Getting content tree from database and saving to cache.")
-  saveRDS(content_tree, content_tree_file)
-  content_tree <- content_tree %>%
-    process_content_tree()
-  
+  message("No cached content tree found. Attempting to fetch from database...")
+  content_tree <- tryCatch({
+    result <- get_content_tree()
+    message("✓ Successfully fetched content tree from database. Saving to cache...")
+    saveRDS(result, content_tree_file)
+    process_content_tree(result)
+  }, error = function(e) {
+    warning(
+      "\n\n========================================\n",
+      "FAILED TO LOAD CONTENT TREE\n",
+      "========================================\n\n",
+      "Could not fetch content tree from database.\n",
+      "Error: ", conditionMessage(e), "\n\n",
+      "The app will start but you won't be able to select lessons.\n",
+      "To fix this, ensure the database proxy is running:\n",
+      "  ./learnable-staging-db\n\n",
+      "Then restart the app.\n",
+      "========================================\n"
+    )
+    # Return empty tibble so app can start
+    tibble::tibble(
+      course = character(),
+      module = character(),
+      chapter = character(),
+      lesson = character(),
+      lesson_id = character(),
+      title_lesson_id = character()
+    )
+  })
 }
 
 content_tree_display <- content_tree %>%
