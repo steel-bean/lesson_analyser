@@ -65,7 +65,9 @@ ui <- fluidPage(
               ),
               plotly::plotlyOutput("lessonPlotly", height = "560px")
             ),
-            
+            div(style = "margin-bottom: 8px;",
+              downloadButton("downloadGroupAnalysis", "Download as CSV", style = "font-size: 13px;")
+            ),
             DTOutput("lessonMetricsTable")
           )
         ),

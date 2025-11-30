@@ -174,7 +174,7 @@ get_content_tree <- function() {
   })
 
   # Query content hierarchy; filter to Module-level nodes to match app scope
-  query <- paste0("\n    SELECT\n      l.id                 AS lesson_id,\n      tn.position          AS level_1_pos,\n      tn.structure_title   AS level_1_title,\n      tn2.position         AS level_2_pos,\n      tn2.structure_title  AS level_2_title,\n      tn3.position         AS level_3_pos,\n      tn3.structure_title  AS level_3_title,\n      tn4.position         AS level_4_pos,\n      tn4.structure_title  AS level_4_title\n    FROM collections c\n    JOIN tree_nodes tn   ON c.root_tree_node_id = tn.id\n    JOIN tree_nodes tn2  ON tn2.parent_id = tn.id\n    JOIN tree_nodes tn3  ON tn3.parent_id = tn2.id\n    JOIN tree_nodes tn4  ON tn4.parent_id = tn3.id\n    JOIN lesson_tree_node ltn ON tn4.id = ltn.tree_node_id\n    JOIN lessons l       ON l.id = ltn.lesson_id\n    where tn2.structure_title like 'Module%'\n    ;\n  ")
+  query <- paste0("\n    SELECT\n      l.id                 AS lesson_id,\n      tn.id                AS level_1_id,\n      tn.position          AS level_1_pos,\n      tn.structure_title   AS level_1_title,\n      tn2.id               AS level_2_id,\n      tn2.position         AS level_2_pos,\n      tn2.structure_title  AS level_2_title,\n      tn3.id               AS level_3_id,\n      tn3.position         AS level_3_pos,\n      tn3.structure_title  AS level_3_title,\n      tn4.id               AS level_4_id,\n      tn4.position         AS level_4_pos,\n      tn4.structure_title  AS level_4_title\n    FROM collections c\n    JOIN tree_nodes tn   ON c.root_tree_node_id = tn.id\n    JOIN tree_nodes tn2  ON tn2.parent_id = tn.id\n    JOIN tree_nodes tn3  ON tn3.parent_id = tn2.id\n    JOIN tree_nodes tn4  ON tn4.parent_id = tn3.id\n    JOIN lesson_tree_node ltn ON tn4.id = ltn.tree_node_id\n    JOIN lessons l       ON l.id = ltn.lesson_id\n    where tn2.structure_title like 'Module%'\n    ;\n  ")
 
   content_index <- dbGetQuery(connection, query)
   dbDisconnect(connection)
@@ -187,8 +187,11 @@ process_content_tree <- function(content_tree) {
   content_tree %>%
     # Map level titles/positions to familiar names used downstream
     transmute(
+      course_id = as.character(level_1_id),
       course    = level_1_title,
+      module_id = as.character(level_2_id),
       module    = level_2_title,
+      chapter_id = as.character(level_3_id),
       chapter   = level_3_title,
       lesson    = level_4_title,
       c_pos     = level_1_pos,
@@ -206,7 +209,7 @@ process_content_tree <- function(content_tree) {
       title_lesson_id = paste0(lesson, " (", lesson_id, ")")
     ) %>%
     arrange(subject, course, module, ch_pos, l_pos) %>%
-    select(course, module, chapter, lesson, lesson_id, title_lesson_id) %>%
+    select(course_id, course, module_id, module, chapter_id, chapter, lesson, lesson_id, title_lesson_id) %>%
     distinct()
 }
 
@@ -253,8 +256,11 @@ if (file.exists(content_tree_file)) {
     )
     # Return empty tibble so app can start
     tibble::tibble(
+      course_id = character(),
       course = character(),
+      module_id = character(),
       module = character(),
+      chapter_id = character(),
       chapter = character(),
       lesson = character(),
       lesson_id = character(),

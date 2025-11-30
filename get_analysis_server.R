@@ -835,16 +835,19 @@ server <- function(input, output, session) {
       # Determine if this is a QA metric (should use mean) or quantitative metric (should use sum)
       is_qa_metric <- grepl("^qa_", m)
 
+      # Determine the ID column name based on aggregation level
+      id_col <- paste0(level, "_id")
+
       df_small <- base %>%
         dplyr::select(lesson_id, value = dplyr::all_of(m)) %>%
-        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, course, module, chapter, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
+        dplyr::left_join(content_tree %>% dplyr::select(lesson_id, course_id, course, module_id, module, chapter_id, chapter, lesson) %>% dplyr::distinct(), by = "lesson_id") %>%
         dplyr::group_by(node = .data[[level]]) %>%
         dplyr::summarise(value = if (is_qa_metric) mean(value, na.rm = TRUE) else sum(value, na.rm = TRUE),
                          grp = if (identical(grp_by, "none")) "All" else dplyr::first(.data[[grp_by]]),
+                         node_id = dplyr::first(.data[[id_col]]),
                          .groups = "drop") %>%
         dplyr::distinct(node, .keep_all = TRUE) %>%
-        dplyr::mutate(node_id = as.character(node),
-                      value = as.numeric(value), grp = as.character(grp)) %>%
+        dplyr::mutate(value = as.numeric(value), grp = as.character(grp)) %>%
         dplyr::relocate(node_id, .before = node)
     }
     df_small <- df_small %>% dplyr::filter(is.finite(value))
@@ -902,6 +905,18 @@ server <- function(input, output, session) {
     xr <- range(c(0, df$value), na.rm = TRUE)
     dist_type <- if (!is.null(input$lessonDist) && identical(input$lessonDist, "Boxplot")) "box" else "hist"
     groups <- if ("grp" %in% names(df)) unique(as.character(df$grp)) else "All"
+
+    # Order groups by their position in the content tree (reversed for bottom-to-top display)
+    grp_by <- input$groupBy %||% "none"
+    if (grp_by != "none" && grp_by %in% names(content_tree)) {
+      tree_group_order <- unique(content_tree[[grp_by]])
+      groups <- tree_group_order[tree_group_order %in% groups]
+      # Add any groups not in tree (shouldn't happen, but fallback)
+      groups <- c(groups, setdiff(unique(as.character(df$grp)), groups))
+      # Reverse so first items appear at bottom (natural reading order)
+      groups <- rev(groups)
+    }
+
     pal_vec <- grDevices::colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(max(1, length(groups)))
     pal <- stats::setNames(pal_vec, groups)
     if (identical(dist_type, "box")) {
@@ -1874,6 +1889,41 @@ server <- function(input, output, session) {
     ) %>%
       DT::formatRound(columns = "value", digits = 2)
   })
+
+  # Download handler for group analysis table
+  output$downloadGroupAnalysis <- downloadHandler(
+    filename = function() {
+      metric_name <- input$lessonMetric %||% "metric"
+      agg_level <- input$aggLevel %||% "level"
+      timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+      paste0("group_analysis_", metric_name, "_", agg_level, "_", timestamp, ".csv")
+    },
+    content = function(file) {
+      pd <- tryCatch(lesson_plot_data(), error = function(e) NULL)
+      if (is.null(pd) || is.null(pd$df) || !is.data.frame(pd$df)) {
+        write.csv(data.frame(), file, row.names = FALSE)
+        return()
+      }
+
+      # Build the same table structure as displayed
+      tbl <- pd$df %>%
+        dplyr::transmute(
+          id = .data$node_id %||% as.character(.data$node),
+          node = as.character(.data$node),
+          group = .data$grp %||% "All",
+          metric = isolate(input$lessonMetric) %||% pd$metric_name,
+          value = .data$value
+        )
+
+      # Filter table to selected members only (if any are selected)
+      sel_members <- selected_members()
+      if (length(sel_members) > 0) {
+        tbl <- tbl %>% dplyr::filter(node %in% sel_members)
+      }
+
+      write.csv(tbl, file, row.names = FALSE)
+    }
+  )
 
   # Metric selection and distribution plot for Lesson Analysis
   numeric_metric_names <- c(
