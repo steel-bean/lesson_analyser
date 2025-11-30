@@ -2,10 +2,14 @@
 source("get_analysis_pipeline.R")
 source("R/helpers_shared_x.R")
 server <- function(input, output, session) {
-  
+
+  # Configuration: Qualitative analysis cache freshness threshold
+  # Set to 7 days for production, or lower for testing (e.g., 0.01 for ~15 minutes)
+  QUALITATIVE_FRESHNESS_DAYS <- 7  # Change to 0.01 for testing, 7 for production
+
   # Holds DB rows (lesson_id, content JSON) fetched on demand
   pulled_content_df <- reactiveVal(NULL)
-  
+
   # Accumulators and progress for incremental analysis
   section_metrics_acc <- reactiveVal(tibble::tibble())
   lesson_metrics_acc  <- reactiveVal(tibble::tibble())
@@ -260,17 +264,25 @@ server <- function(input, output, session) {
     idx <- .state$idx + 1L
     lid <- .state$ids[[idx]]
 
-    # Check analysis cache (fresh within 7 days / 1 week)
+    # Check analysis cache (fresh within configured threshold)
     now_ts <- Sys.time()
-    fresh_cutoff <- now_ts - as.difftime(7, units = "days")
+    fresh_cutoff <- now_ts - as.difftime(QUALITATIVE_FRESHNESS_DAYS, units = "days")
     cached <- NULL
+    use_stale <- !is.null(.state$use_stale_qualitative) && .state$use_stale_qualitative
 
     if (!is.null(.state$analysis_cache) && nrow(.state$analysis_cache)) {
       cand <- .state$analysis_cache %>% dplyr::filter(lesson_id == lid)
       if (nrow(cand)) {
         if ("analyzed_at" %in% names(cand)) {
-          cand_fresh <- cand %>% dplyr::filter(analyzed_at >= fresh_cutoff)
-          if (nrow(cand_fresh)) cached <- cand_fresh
+          # If user explicitly chose to use stale data, accept any cached data
+          # Otherwise, only accept data within the freshness window
+          if (use_stale) {
+            cand_fresh <- cand %>% dplyr::filter(!is.na(analyzed_at))
+            if (nrow(cand_fresh)) cached <- cand_fresh
+          } else {
+            cand_fresh <- cand %>% dplyr::filter(analyzed_at >= fresh_cutoff)
+            if (nrow(cand_fresh)) cached <- cand_fresh
+          }
         }
       }
     }
@@ -330,14 +342,27 @@ server <- function(input, output, session) {
         dplyr::filter(lesson_id == lid)
 
       has_fresh_qual <- FALSE
-      if (nrow(existing_qual) > 0 && "qa_analyzed_at" %in% names(existing_qual) && "qa_status" %in% names(existing_qual)) {
-        # Filter to only successful analyses within the freshness window
-        fresh_successful <- existing_qual %>%
-          dplyr::filter(
-            qa_status == "success",
-            !is.na(qa_analyzed_at),
-            qa_analyzed_at >= fresh_cutoff
-          )
+      # Check if user requested fresh analysis (force_fresh flag) or to use stale cache
+      force_fresh <- !is.null(.state$force_fresh_qualitative) && .state$force_fresh_qualitative
+      use_stale <- !is.null(.state$use_stale_qualitative) && .state$use_stale_qualitative
+
+      if (!force_fresh && nrow(existing_qual) > 0 && "qa_analyzed_at" %in% names(existing_qual) && "qa_status" %in% names(existing_qual)) {
+        # If user explicitly chose to use stale data, accept any successful analysis
+        # Otherwise, only accept analyses within the freshness window
+        if (use_stale) {
+          fresh_successful <- existing_qual %>%
+            dplyr::filter(
+              qa_status == "success",
+              !is.na(qa_analyzed_at)
+            )
+        } else {
+          fresh_successful <- existing_qual %>%
+            dplyr::filter(
+              qa_status == "success",
+              !is.na(qa_analyzed_at),
+              qa_analyzed_at >= fresh_cutoff
+            )
+        }
 
         if (nrow(fresh_successful) > 0) {
           # Get the most recent successful analysis
@@ -348,14 +373,17 @@ server <- function(input, output, session) {
           has_fresh_qual <- TRUE
           qa_timestamp <- latest_analysis$qa_analyzed_at[[1]]
           qa_model <- if ("qa_model" %in% names(latest_analysis)) latest_analysis$qa_model[[1]] else "unknown"
+          age_text <- if (use_stale) " (using stale cache)" else ""
           message("  Using cached qualitative analysis for lesson ", lid, " (",
-                  round(as.numeric(difftime(now_ts, qa_timestamp, units = "days")), 1), " days old, model: ", qa_model, ")")
+                  round(as.numeric(difftime(now_ts, qa_timestamp, units = "days")), 1), " days old, model: ", qa_model, ")", age_text)
         } else {
           # Check if there are any analyses at all (even failed ones)
           if (nrow(existing_qual) > 0) {
-            message("  Found ", nrow(existing_qual), " existing analysis/analyses for lesson ", lid, " but none are fresh and successful - running new analysis")
+            message("  Found ", nrow(existing_qual), " existing analysis/analyses for lesson ", lid, " but none are successful - running new analysis")
           }
         }
+      } else if (force_fresh) {
+        message("  Force fresh qualitative analysis requested for lesson ", lid, " - skipping cache")
       }
 
       if (!has_fresh_qual) {
@@ -554,26 +582,138 @@ server <- function(input, output, session) {
       }
   }
 
-  observeEvent(input$pullContent, {
-    ids <- selected_lesson_ids()
-    # Reset accumulators and progress and ids
+  # Helper function to start analysis processing
+  start_analysis_processing <- function(ids, selected_model, force_fresh = FALSE, use_stale = FALSE) {
     section_metrics_acc(tibble::tibble())
     lesson_metrics_acc(tibble::tibble())
-    # Capture the selected model at button click time so it's available in async processing
-    selected_model <- input$qualitativeModel
     .state$selected_model <- if (!is.null(selected_model) && nchar(selected_model) > 0) selected_model else NULL
-    # Check if qualitative analysis is enabled based on model selection
     .state$qualitative_enabled <- !is.null(.state$selected_model)
-    # DO NOT reset qual_results - we want to preserve the cache between runs
-    # .state$qual_results is only initialized once at startup and persists
+    .state$force_fresh_qualitative <- force_fresh
+    .state$use_stale_qualitative <- use_stale
     .state$ids <- ids
     .state$total <- length(ids)
     .state$idx <- 0L
     .state$sec_acc <- tibble::tibble()
     .state$les_acc <- tibble::tibble()
     progress_info(list(done = 0L, total = .state$total))
-    # Kick off processing (non-blocking)
     if (.state$total > 0L) later::later(process_next_lesson, delay = 0)
+  }
+
+  observeEvent(input$pullContent, {
+    ids <- selected_lesson_ids()
+    selected_model <- input$qualitativeModel
+
+    # Check for stale analyses (quantitative and/or qualitative)
+    now_ts <- Sys.time()
+    stale_cutoff <- now_ts - as.difftime(QUALITATIVE_FRESHNESS_DAYS, units = "days")
+
+    stale_quant_count <- 0
+    stale_qual_count <- 0
+
+    # Check quantitative cache (only for selected lessons)
+    if (!is.null(.state$analysis_cache) && nrow(.state$analysis_cache) > 0) {
+      selected_ids <- as.character(ids)
+
+      # Get the most recent analysis timestamp for each selected lesson
+      lesson_latest <- .state$analysis_cache %>%
+        dplyr::filter(as.character(lesson_id) %in% selected_ids) %>%
+        dplyr::group_by(lesson_id) %>%
+        dplyr::summarise(
+          latest_analyzed_at = max(analyzed_at, na.rm = TRUE),
+          .groups = "drop"
+        )
+
+      # Count how many selected lessons have stale latest analyses
+      if (nrow(lesson_latest) > 0) {
+        stale_quant_count <- lesson_latest %>%
+          dplyr::filter(
+            !is.na(latest_analyzed_at),
+            is.finite(latest_analyzed_at),
+            latest_analyzed_at < stale_cutoff
+          ) %>%
+          nrow()
+      }
+    }
+
+    # Check qualitative cache if qualitative analysis is enabled (only for selected lessons)
+    if (!is.null(selected_model) && nchar(selected_model) > 0 && !is.null(.state$qual_results) && nrow(.state$qual_results) > 0) {
+      selected_ids <- as.character(ids)
+
+      # Qualitative results should have one row per lesson, but let's get the latest per lesson to be safe
+      lesson_qual_latest <- .state$qual_results %>%
+        dplyr::filter(as.character(lesson_id) %in% selected_ids) %>%
+        dplyr::group_by(lesson_id) %>%
+        dplyr::arrange(dplyr::desc(qa_analyzed_at)) %>%
+        dplyr::slice(1) %>%
+        dplyr::ungroup()
+
+      # Count how many selected lessons have stale successful qualitative analyses
+      if (nrow(lesson_qual_latest) > 0) {
+        stale_qual_count <- lesson_qual_latest %>%
+          dplyr::filter(
+            qa_status == "success",
+            !is.na(qa_analyzed_at),
+            qa_analyzed_at < stale_cutoff
+          ) %>%
+          nrow()
+      }
+    }
+
+    # If any stale data found, show unified modal
+    if (stale_quant_count > 0 || stale_qual_count > 0) {
+      threshold_text <- if (QUALITATIVE_FRESHNESS_DAYS >= 1) {
+        paste0(round(QUALITATIVE_FRESHNESS_DAYS), " day(s)")
+      } else {
+        paste0(round(QUALITATIVE_FRESHNESS_DAYS * 24, 1), " hour(s)")
+      }
+
+      status_lines <- list()
+      if (stale_quant_count > 0) {
+        status_lines <- c(status_lines, list(tags$p(paste0(stale_quant_count, " lesson(s) have quantitative analyses that are over ", threshold_text, " old."))))
+      }
+      if (stale_qual_count > 0) {
+        status_lines <- c(status_lines, list(tags$p(paste0(stale_qual_count, " lesson(s) have qualitative analyses that are over ", threshold_text, " old."))))
+      }
+
+      showModal(modalDialog(
+        title = "Stale Cache Detected",
+        tagList(
+          status_lines,
+          tags$p("Would you like to:"),
+          tags$ul(
+            tags$li(tags$strong("Use Existing:"), " Use the cached analyses (faster, no re-computation)"),
+            tags$li(tags$strong("Run Fresh:"), " Re-analyze stale lessons (fresh analyses may be used for non-stale lessons)")
+          )
+        ),
+        footer = tagList(
+          actionButton("useStaleCache", "Use Existing", icon = icon("database")),
+          actionButton("runFreshCache", "Run Fresh", icon = icon("sync"), class = "btn-primary"),
+          modalButton("Cancel")
+        ),
+        easyClose = FALSE,
+        size = "m"
+      ))
+      return()
+    }
+
+    # No stale data - proceed normally
+    start_analysis_processing(ids, selected_model, force_fresh = FALSE)
+  })
+
+  # Handle user choosing to use stale cache
+  observeEvent(input$useStaleCache, {
+    removeModal()
+    ids <- selected_lesson_ids()
+    selected_model <- input$qualitativeModel
+    start_analysis_processing(ids, selected_model, force_fresh = FALSE, use_stale = TRUE)
+  })
+
+  # Handle user choosing to run fresh analysis
+  observeEvent(input$runFreshCache, {
+    removeModal()
+    ids <- selected_lesson_ids()
+    selected_model <- input$qualitativeModel
+    start_analysis_processing(ids, selected_model, force_fresh = TRUE, use_stale = FALSE)
   })
 
   # Preview of pulled JSON per lesson
@@ -1868,7 +2008,7 @@ server <- function(input, output, session) {
     # Build display table showing the selected metric
     tbl <- pd$df %>%
       dplyr::transmute(
-        id = .data$node_id %||% as.character(.data$node),
+        id = as.integer(.data$node_id %||% as.character(.data$node)),
         node = as.character(.data$node),
         group = .data$grp %||% "All",
         metric = isolate(input$lessonMetric) %||% pd$metric_name,
@@ -1908,7 +2048,7 @@ server <- function(input, output, session) {
       # Build the same table structure as displayed
       tbl <- pd$df %>%
         dplyr::transmute(
-          id = .data$node_id %||% as.character(.data$node),
+          id = as.integer(.data$node_id %||% as.character(.data$node)),
           node = as.character(.data$node),
           group = .data$grp %||% "All",
           metric = isolate(input$lessonMetric) %||% pd$metric_name,
@@ -2370,8 +2510,13 @@ server <- function(input, output, session) {
     qjson <- tryCatch(as.character(row$qualitative_json[[1]]), error = function(e) "")
     a <- tryCatch(jsonlite::fromJSON(qjson, simplifyVector = FALSE), error = function(e) NULL)
 
-    # Build formatted display
+    # Build formatted display and plain text version
     content_parts <- list()
+    plain_text_parts <- c()
+
+    # Title
+    plain_text_parts <- c(plain_text_parts, paste0("Qualitative Analysis - Lesson ", as.character(row$lesson_id %||% "")))
+    plain_text_parts <- c(plain_text_parts, paste(rep("=", 60), collapse = ""))
 
     if (!is.null(a) && !is.null(a$analysis)) {
       analysis <- a$analysis
@@ -2387,6 +2532,7 @@ server <- function(input, output, session) {
           tags$h4("Lesson Typing"),
           tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", typing_text)
         )
+        plain_text_parts <- c(plain_text_parts, "", "LESSON TYPING", typing_text)
       }
 
       # Rubric Scores Section
@@ -2405,6 +2551,7 @@ server <- function(input, output, session) {
           tags$h4("Rubric Scores"),
           tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", rubric_text)
         )
+        plain_text_parts <- c(plain_text_parts, "", "RUBRIC SCORES", rubric_text)
       }
 
       # Priority Index Section
@@ -2422,6 +2569,7 @@ server <- function(input, output, session) {
           tags$h4("Priority Index"),
           tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", priority_text)
         )
+        plain_text_parts <- c(plain_text_parts, "", "PRIORITY INDEX", priority_text)
       }
 
       # Atomic Lesson Assessment
@@ -2435,6 +2583,7 @@ server <- function(input, output, session) {
           tags$h4("Atomic Lesson Assessment"),
           tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", atomic_text)
         )
+        plain_text_parts <- c(plain_text_parts, "", "ATOMIC LESSON ASSESSMENT", atomic_text)
       }
 
       # Metadata
@@ -2462,17 +2611,44 @@ server <- function(input, output, session) {
         tags$h4("Analysis Metadata"),
         tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", meta_text)
       )
+      # Don't include metadata in the copied plain text
     }
+
+    # Combine plain text parts
+    plain_text_report <- paste(plain_text_parts, collapse = "\n")
 
     showModal(modalDialog(
       title = paste("Qualitative Analysis - Lesson", as.character(row$lesson_id %||% "")),
       tagList(
+        tags$div(
+          style = "margin-bottom: 12px;",
+          actionButton("copyReportBtn", "Copy Report to Clipboard",
+                      icon = icon("clipboard"),
+                      style = "font-size: 13px;")
+        ),
         if (length(content_parts) > 0) content_parts else tags$em("No analysis data available."),
         tags$hr(),
-        tags$details(tags$summary("Raw JSON"), tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", qjson))
+        tags$details(tags$summary("Raw JSON"), tags$pre(style = "white-space: pre-wrap; word-wrap: break-word;", qjson)),
+        # Hidden textarea for clipboard copy
+        tags$textarea(id = "reportTextArea", style = "position: absolute; left: -9999px;", plain_text_report)
       ),
       easyClose = TRUE,
-      size = "l"
+      size = "l",
+      footer = tagList(
+        tags$script(HTML("
+          $(document).on('click', '#copyReportBtn', function() {
+            var copyText = document.getElementById('reportTextArea');
+            copyText.style.position = 'static';
+            copyText.select();
+            document.execCommand('copy');
+            copyText.style.position = 'absolute';
+            $(this).html('<i class=\"fa fa-check\"></i> Copied!');
+            setTimeout(function() {
+              $('#copyReportBtn').html('<i class=\"fa fa-clipboard\"></i> Copy Report to Clipboard');
+            }, 2000);
+          });
+        "))
+      )
     ))
   })
   
